@@ -179,7 +179,14 @@ async def analyze_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             model=GEMINI_MODEL,
             contents=request_parts,
         )
-        analysis = response.text
+        analysis = (response.text or "").strip()
+        if not analysis:
+            logger.error("Gemini پاسخ خالی برگردوند. جزئیات پاسخ: %s", response)
+            analysis = (
+                "⚠️ متاسفانه هوش مصنوعی نتونست تحلیلی برای این عکس‌ها تولید کنه "
+                "(ممکنه به‌خاطر فیلترهای ایمنی مدل یا کیفیت/محتوای عکس‌ها باشه). "
+                "لطفاً دوباره با /start شروع کن و عکس‌های واضح‌تری امتحان کن."
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception("خطا در فراخوانی Gemini API")
         analysis = (
@@ -187,7 +194,13 @@ async def analyze_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"جزئیات خطا برای دیباگ: {exc}"
         )
  
-    await update.message.reply_text(analysis)
+    try:
+        await update.message.reply_text(analysis)
+    except Exception:  # noqa: BLE001
+        logger.exception("ارسال پیام تحلیل به کاربر با خطا مواجه شد")
+        await update.message.reply_text(
+            "⚠️ در ارسال نتیجه‌ی تحلیل مشکلی پیش اومد. لطفاً دوباره با /start امتحان کن."
+        )
  
     # پاکسازی فایل‌های موقت
     for path in photos:
@@ -267,3 +280,4 @@ def main() -> None:
  
 if __name__ == "__main__":
     main()
+ 
