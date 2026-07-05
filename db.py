@@ -86,3 +86,11 @@ def get_case_by_number(case_number: str, user_id: int):
             (case_number, user_id),
         ).fetchone()
     return row
+
+
+def count_user_cases(user_id: int) -> int:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM cases WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row[0] if row else 0
