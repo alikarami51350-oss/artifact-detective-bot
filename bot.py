@@ -17,6 +17,7 @@ from PIL import Image
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -40,6 +41,9 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+_admin_chat_id_raw = os.getenv("ADMIN_CHAT_ID", "").strip()
+ADMIN_CHAT_ID = int(_admin_chat_id_raw) if _admin_chat_id_raw else None
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -510,6 +514,26 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
 
     case_number = db.create_case(user_id, environment, size, material, notes, analysis)
 
+    if ADMIN_CHAT_ID:
+        await send_for_admin_review(
+            context=context,
+            case_number=case_number,
+            user_chat_id=chat_id,
+            environment=environment,
+            size=size,
+            material=material,
+            notes=notes,
+            analysis=analysis,
+            photos=photos,
+            progress_message=progress_message,
+        )
+        for path in photos:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return
+
     try:
         await progress_message.edit_text(
             "🧠 <b>در حال تحلیل پرونده</b>\n\n"
@@ -544,6 +568,140 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
             os.remove(path)
         except OSError:
             pass
+
+
+async def send_for_admin_review(
+    context: ContextTypes.DEFAULT_TYPE,
+    case_number: str,
+    user_chat_id: int,
+    environment: str,
+    size: str,
+    material: str,
+    notes: str,
+    analysis: str,
+    photos: list,
+    progress_message,
+) -> None:
+    """گزارش رو برای تایید/ویرایش ادمین می‌فرسته، به‌جای ارسال مستقیم به کاربر."""
+    pending = context.bot_data.setdefault("pending_reviews", {})
+    pending[case_number] = {"user_chat_id": user_chat_id, "draft": analysis}
+
+    try:
+        if photos:
+            media = [InputMediaPhoto(open(p, "rb")) for p in photos]
+            await context.bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media)
+    except Exception:  # noqa: BLE001
+        logger.exception("ارسال عکس‌ها برای بازبینی ادمین با خطا مواجه شد")
+
+    review_header = (
+        "🕵️ <b>پرونده‌ی جدید در انتظار تایید</b>\n\n"
+        f"شماره: {case_number}\n"
+        f"محیط: {environment} | اندازه: {size} | جنس: {material}\n"
+        f"توضیح کاربر: {notes}\n"
+    )
+    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=review_header, parse_mode="HTML")
+    await send_long_message(context.bot, ADMIN_CHAT_ID, analysis)
+
+    review_keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ تایید و ارسال", callback_data=f"review|approve|{case_number}"
+                ),
+                InlineKeyboardButton("✏️ ویرایش", callback_data=f"review|edit|{case_number}"),
+            ]
+        ]
+    )
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID, text="تصمیم شما؟", reply_markup=review_keyboard
+    )
+
+    try:
+        await progress_message.edit_text(
+            "🧠 <b>در حال تحلیل پرونده</b>\n\n"
+            "✓ دریافت تصاویر\n"
+            "✓ کنترل کیفیت\n"
+            "✓ استخراج ویژگی‌ها و تحلیل ساختار\n"
+            "✓ تولید گزارش\n"
+            "⏳ در انتظار تایید نهایی کارشناس...\n",
+            parse_mode="HTML",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    await context.bot.send_message(
+        chat_id=user_chat_id,
+        text=(
+            f"📁 پرونده‌ی شما ثبت شد (شماره: {case_number}).\n"
+            "گزارش در حال بررسی نهاییه و به‌زودی نتیجه رو دریافت می‌کنید. ممنون از صبرتون! 🙏"
+        ),
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
+
+
+async def on_review_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, action, case_number = query.data.split("|", 2)
+
+    pending = context.bot_data.get("pending_reviews", {})
+    review = pending.get(case_number)
+
+    if not review:
+        await query.edit_message_text("⚠️ این پرونده قبلاً پردازش شده یا پیدا نشد.")
+        return
+
+    if action == "approve":
+        final_text = f"📁 شماره‌ی پرونده: {case_number}\n\n{review['draft']}"
+        await send_long_message(context.bot, review["user_chat_id"], final_text)
+        await context.bot.send_message(
+            chat_id=review["user_chat_id"],
+            text="برای شروع یه تحلیل جدید از منو انتخاب کن:",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        db.update_case_analysis(case_number, review["draft"])
+        del pending[case_number]
+        await query.edit_message_text(f"✅ پرونده‌ی {case_number} تایید و برای کاربر ارسال شد.")
+
+    elif action == "edit":
+        editing = context.bot_data.setdefault("editing_case", {})
+        editing[update.effective_chat.id] = case_number
+        await query.edit_message_text(
+            f"✏️ در حال ویرایش پرونده‌ی {case_number}.\n"
+            "متن فعلی رو در پیام بعدی می‌فرستم — کپی کن، تغییرات لازم رو بده، "
+            "و نسخه‌ی نهایی رو به‌صورت یک پیام کامل برام بفرست:"
+        )
+        await send_long_message(context.bot, update.effective_chat.id, review["draft"])
+
+
+async def admin_edit_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    admin_chat_id = update.effective_chat.id
+    editing = context.bot_data.get("editing_case", {})
+    case_number = editing.get(admin_chat_id)
+    if not case_number:
+        return  # ادمین در حالت ویرایش نیست؛ این پیام مربوط به چیز دیگه‌ایه
+
+    pending = context.bot_data.get("pending_reviews", {})
+    review = pending.get(case_number)
+    if not review:
+        await update.message.reply_text("⚠️ این پرونده دیگه در انتظار تایید نیست.")
+        editing.pop(admin_chat_id, None)
+        return
+
+    final_text = f"📁 شماره‌ی پرونده: {case_number}\n\n{update.message.text}"
+    await send_long_message(context.bot, review["user_chat_id"], final_text)
+    await context.bot.send_message(
+        chat_id=review["user_chat_id"],
+        text="برای شروع یه تحلیل جدید از منو انتخاب کن:",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
+
+    db.update_case_analysis(case_number, update.message.text)
+    del pending[case_number]
+    editing.pop(admin_chat_id, None)
+    await update.message.reply_text(
+        f"✅ نسخه‌ی ویرایش‌شده برای کاربر ارسال شد (پرونده {case_number})."
+    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -620,6 +778,19 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(on_subscription_buy_clicked, pattern=r"^sub\|buy$"))
     application.add_handler(CallbackQueryHandler(on_encyclopedia_topic_selected, pattern=r"^enc\|"))
     application.add_handler(CommandHandler("mycases", my_cases))
+
+    application.add_handler(CallbackQueryHandler(on_review_decision, pattern=r"^review\|"))
+    if ADMIN_CHAT_ID:
+        application.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=ADMIN_CHAT_ID) & filters.TEXT & ~filters.COMMAND,
+                admin_edit_text_handler,
+            )
+        )
+    else:
+        logger.warning(
+            "ADMIN_CHAT_ID تنظیم نشده؛ تحلیل‌ها بدون تایید مستقیماً برای کاربر ارسال می‌شن."
+        )
 
     external_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 
