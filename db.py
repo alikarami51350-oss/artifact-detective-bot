@@ -94,3 +94,11 @@ def count_user_cases(user_id: int) -> int:
             "SELECT COUNT(*) FROM cases WHERE user_id = ?", (user_id,)
         ).fetchone()
     return row[0] if row else 0
+
+
+def update_case_analysis(case_number: str, analysis: str) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE cases SET analysis = ? WHERE case_number = ?", (analysis, case_number)
+        )
+        conn.commit()
