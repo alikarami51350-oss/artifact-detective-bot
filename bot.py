@@ -48,6 +48,35 @@ logger = logging.getLogger(__name__)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+TELEGRAM_SAFE_MESSAGE_LENGTH = 3500
+
+
+async def send_long_message(bot, chat_id: int, text: str) -> None:
+    """پیام‌های طولانی‌تر از سقف مجاز تلگرام رو به چند پیام تقسیم می‌کنه.
+
+    این رفع‌کننده‌ی باگی است که وقتی کاربر توضیح اضافه (نکات) وارد می‌کرد و
+    مجموع طول گزارش از سقف ۴۰۹۶ کاراکتری تلگرام رد می‌شد، باعث می‌شد ارسال
+    پیام با خطا مواجه بشه و کاربر هیچ جوابی نگیره.
+    """
+    if len(text) <= TELEGRAM_SAFE_MESSAGE_LENGTH:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return
+
+    remaining = text
+    while remaining:
+        if len(remaining) <= TELEGRAM_SAFE_MESSAGE_LENGTH:
+            chunk = remaining
+            remaining = ""
+        else:
+            split_at = remaining.rfind("\n\n", 0, TELEGRAM_SAFE_MESSAGE_LENGTH)
+            if split_at <= 0:
+                split_at = remaining.rfind("\n", 0, TELEGRAM_SAFE_MESSAGE_LENGTH)
+            if split_at <= 0:
+                split_at = TELEGRAM_SAFE_MESSAGE_LENGTH
+            chunk = remaining[:split_at]
+            remaining = remaining[split_at:].lstrip("\n")
+        await bot.send_message(chat_id=chat_id, text=chunk)
+
 # ---------------------------------------------------------------------------
 # منوی اصلی
 # ---------------------------------------------------------------------------
@@ -55,9 +84,14 @@ BTN_NEW_CASE = "📂 پرونده جدید"
 BTN_MY_CASES = "📁 پرونده‌های من"
 BTN_ENCYCLOPEDIA = "📚 دانشنامه"
 BTN_ACCOUNT = "⚙️ حساب من"
+BTN_SUBSCRIPTION = "💎 اشتراک حرفه‌ای"
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_NEW_CASE, BTN_MY_CASES], [BTN_ENCYCLOPEDIA, BTN_ACCOUNT]],
+    [
+        [BTN_NEW_CASE, BTN_MY_CASES],
+        [BTN_ENCYCLOPEDIA, BTN_ACCOUNT],
+        [BTN_SUBSCRIPTION],
+    ],
     resize_keyboard=True,
 )
 
@@ -148,6 +182,35 @@ async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "این یک نسخه‌ی آزمایشی و رایگانه؛ در حال حاضر امکانات پولی/اشتراک "
         "فعال نیست.",
         parse_mode="HTML",
+    )
+
+
+async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "💎 <b>نسخه‌ی حرفه‌ای</b>\n\n"
+        "مزایای نسخه‌ی حرفه‌ای نسبت به نسخه‌ی رایگان:\n\n"
+        "✔ تحلیل نامحدود (بدون محدودیت تعداد در ماه)\n"
+        "✔ خروجی PDF از هر گزارش، آماده برای چاپ یا اشتراک‌گذاری\n"
+        "✔ آرشیو کامل و بدون محدودیت پرونده‌ها\n"
+        "✔ اولویت در پردازش (پاسخ سریع‌تر در ساعات شلوغ)\n"
+        "✔ دسترسی زودهنگام به قابلیت‌های جدید\n\n"
+        "قیمت: به‌زودی اعلام می‌شه.\n"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛒 خرید اشتراک", callback_data="sub|buy")]]
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def on_subscription_buy_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            "🚧 پرداخت آنلاین هنوز فعال نشده (به‌زودی از طریق درگاه داخلی "
+            "زرین‌پال اضافه می‌شه). فعلاً نسخه‌ی رایگان بدون محدودیت در دسترسه."
+        ),
     )
 
 
@@ -390,11 +453,12 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
     )
 
     system_prompt = (
-        "تو یک باستان‌شناس باتجربه و تحلیلگر تصویر هستی. کاربر چند عکس از یک شی "
-        "از زوایای مختلف به همراه چند اطلاعات زمینه‌ای درباره‌ی محل پیدا شدن آن شی "
-        "فرستاده. وظیفه‌ی تو اینه که فقط بر اساس شواهد بصری واقعی موجود در عکس‌ها "
-        "(شکل، تقارن، بافت سطح، الگوهای هندسی، آثار ابزار، فرسایش طبیعی و غیره) "
-        "و اطلاعات زمینه‌ای که کاربر داده، یک تحلیل مستدل و شفاف ارائه بدی.\n\n"
+        "تو یک باستان‌شناس میدانی باتجربه هستی که سال‌ها روی شناسایی آثار کار "
+        "کرده‌ای. کاربر چند عکس از یک شی از زوایای مختلف به همراه چند اطلاعات "
+        "زمینه‌ای درباره‌ی محل پیدا شدن آن شی فرستاده. مثل یک کارشناس واقعی "
+        "صحبت کن: جایی که شواهد بصری قوی و روشنه، با اطمینان و قاطعیت نظر بده؛ "
+        "جایی که شواهد ناکافیه، صادقانه بگو که نمی‌شه مطمئن بود — نه بیشتر و نه "
+        "کمتر از چیزی که واقعاً از عکس‌ها قابل استنتاجه.\n\n"
         "پاسخ رو دقیقاً با همین ۵ بخش و همین سرتیترها (بدون تغییر) بنویس:\n\n"
         "📄 خلاصه:\n"
         "(۲-۳ جمله خلاصه‌ی نتیجه‌گیری کلی، شامل احتمال ساخته‌ی دست بشر بودن یا "
@@ -409,8 +473,12 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
         "📌 پیشنهاد:\n"
         "(تاکید کن این فقط تحلیل اولیه‌ی هوش مصنوعیه و برای تایید قطعی باید حتماً "
         "با یک باستان‌شناس یا سازمان میراث فرهنگی محلی تماس بگیرن)\n\n"
-        "لحن باید حرفه‌ای و قابل فهم برای عموم باشه، بدون قطعیت کاذب، و بدون "
-        "استفاده از ستاره یا نشانه‌های Markdown (فقط متن ساده با همین ایموجی‌ها)."
+        "قوانین سخت‌گیرانه:\n"
+        "- هرگز چیزی رو که در عکس‌ها قابل مشاهده نیست ادعا نکن.\n"
+        "- هرگز برای ایجاد هیجان کاذب یا القای ارزش/اصالت بالاتر از چیزی که "
+        "شواهد نشون می‌ده، اغراق نکن. صداقت علمی مهم‌تر از جذاب بودن پاسخه.\n"
+        "- از ستاره یا نشانه‌های Markdown استفاده نکن (فقط متن ساده با همین "
+        "ایموجی‌ها)."
     )
 
     request_parts = [
@@ -457,7 +525,7 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
     final_message = f"📁 شماره‌ی پرونده: {case_number}\n\n{analysis}"
 
     try:
-        await context.bot.send_message(chat_id=chat_id, text=final_message)
+        await send_long_message(context.bot, chat_id, final_message)
     except Exception:  # noqa: BLE001
         logger.exception("ارسال پیام تحلیل به کاربر با خطا مواجه شد")
         await context.bot.send_message(
@@ -546,6 +614,10 @@ def main() -> None:
         MessageHandler(filters.Regex(f"^{BTN_ENCYCLOPEDIA}$"), show_encyclopedia)
     )
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_ACCOUNT}$"), show_account))
+    application.add_handler(
+        MessageHandler(filters.Regex(f"^{BTN_SUBSCRIPTION}$"), show_subscription)
+    )
+    application.add_handler(CallbackQueryHandler(on_subscription_buy_clicked, pattern=r"^sub\|buy$"))
     application.add_handler(CallbackQueryHandler(on_encyclopedia_topic_selected, pattern=r"^enc\|"))
     application.add_handler(CommandHandler("mycases", my_cases))
 
