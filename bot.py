@@ -10,6 +10,7 @@
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from google import genai
@@ -33,6 +34,7 @@ from telegram.ext import (
 )
 
 import db
+import plans
 import quality
 from encyclopedia import ENCYCLOPEDIA_TOPICS
 
@@ -49,6 +51,42 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+def get_quota_status(user_id: int) -> dict:
+    """پلن فعلی، سهمیه‌ی باقی‌مانده، و اعتبار کاربر رو محاسبه می‌کنه."""
+    user = db.get_user(user_id)
+    plan_id = user["plan"] if user else "explorer"
+    plan = plans.PLANS.get(plan_id, plans.PLANS["explorer"])
+
+    # اگه پلن پولی منقضی شده باشه، به‌صورت موقت به‌عنوان explorer حساب می‌شه
+    if plan_id != "explorer" and user and user["plan_expires_at"]:
+        try:
+            expires = datetime.fromisoformat(user["plan_expires_at"])
+            if expires < datetime.now(timezone.utc):
+                plan_id = "explorer"
+                plan = plans.PLANS["explorer"]
+        except ValueError:
+            pass
+
+    if plan.get("lifetime_quota") is not None:
+        used = db.count_user_cases(user_id)
+        remaining = plan["lifetime_quota"] - used
+    else:
+        used = db.get_monthly_case_count(user_id)
+        remaining = plan["monthly_quota"] - used
+
+    credits = user["analysis_credits"] if user else 0
+    remaining = max(0, remaining)
+
+    return {
+        "plan_id": plan_id,
+        "plan_label": plan["label"],
+        "remaining": remaining,
+        "credits": credits,
+        "can_proceed": remaining > 0 or credits > 0,
+        "will_use_credit": remaining <= 0 and credits > 0,
+    }
+
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -89,12 +127,13 @@ BTN_MY_CASES = "📁 پرونده‌های من"
 BTN_ENCYCLOPEDIA = "📚 دانشنامه"
 BTN_ACCOUNT = "⚙️ حساب من"
 BTN_SUBSCRIPTION = "💎 اشتراک حرفه‌ای"
+BTN_INVITE = "🎁 دعوت دوستان"
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [BTN_NEW_CASE, BTN_MY_CASES],
         [BTN_ENCYCLOPEDIA, BTN_ACCOUNT],
-        [BTN_SUBSCRIPTION],
+        [BTN_SUBSCRIPTION, BTN_INVITE],
     ],
     resize_keyboard=True,
 )
@@ -144,6 +183,28 @@ def build_inline_keyboard(options, prefix):
 # دستورات و منوی سطح‌بالا
 # ---------------------------------------------------------------------------
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    referral_code = context.args[0] if context.args else None
+
+    _, referrer_id = db.get_or_create_user(
+        user.id, first_name=user.first_name or "", referral_code=referral_code
+    )
+
+    if referrer_id:
+        try:
+            await context.bot.send_message(
+                chat_id=referrer_id,
+                text=(
+                    "🎉 یکی از دوستانت با لینک دعوت تو وارد ربات شد!\n"
+                    f"💳 {db.REFERRAL_REFERRER_BONUS_CREDITS} اعتبار تحلیل به حسابت اضافه شد."
+                ),
+            )
+            milestone_msg = db.check_and_grant_milestones(referrer_id)
+            if milestone_msg:
+                await context.bot.send_message(chat_id=referrer_id, text=milestone_msg)
+        except Exception:  # noqa: BLE001
+            logger.exception("اطلاع‌رسانی پاداش دعوت به معرف با خطا مواجه شد")
+
     await update.message.reply_text(
         "🏛 <b>ArchaeoLens</b> — دستیار هوشمند تحلیل آثار تاریخی\n\n"
         "👋 خوش اومدی! از منوی زیر انتخاب کن:",
@@ -176,34 +237,127 @@ async def my_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    db.get_or_create_user(user.id, first_name=user.first_name or "")
+
+    user_row = db.get_user(user.id)
+    status = get_quota_status(user.id)
     case_count = db.count_user_cases(user.id)
+
+    plan = plans.PLANS[status["plan_id"]]
+    if status["plan_id"] == "explorer":
+        quota_line = f"📊 سهمیه‌ی باقی‌مانده: {status['remaining']} پرونده (مجموع)"
+    else:
+        quota_line = f"📊 سهمیه‌ی این ماه: {status['remaining']} پرونده باقی‌مانده"
+        expires = user_row["plan_expires_at"]
+        if expires:
+            quota_line += f"\n📅 انقضای پلن: {expires[:10]}"
+
+    keyboard = None
+    if user_row["loyalty_points"] >= db.LOYALTY_POINTS_PER_CREDIT:
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏆 تبدیل امتیاز به اعتبار", callback_data="loyalty|redeem")]]
+        )
 
     await update.message.reply_text(
         "⚙️ <b>حساب من</b>\n\n"
         f"👤 نام: {user.full_name}\n"
-        f"📂 تعداد پرونده‌ها: {case_count}\n"
-        f"💎 سطح اشتراک: نسخه‌ی رایگان\n\n"
-        "این یک نسخه‌ی آزمایشی و رایگانه؛ در حال حاضر امکانات پولی/اشتراک "
-        "فعال نیست.",
+        f"🔖 کد دعوت شما: <code>{user_row['referral_code']}</code>\n"
+        f"💎 پلن فعلی: {plan['label']}\n"
+        f"{quota_line}\n"
+        f"💳 اعتبار اضافه: {status['credits']} تحلیل\n"
+        f"📂 تعداد کل پرونده‌ها: {case_count}\n"
+        f"🎁 دوستان دعوت‌شده‌ی موفق: {user_row['successful_referrals']}\n"
+        f"🏆 امتیاز وفاداری: {user_row['loyalty_points']}\n",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def on_loyalty_redeem_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    credits_granted = db.redeem_loyalty_points(user_id)
+    if credits_granted > 0:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ {credits_granted} امتیاز وفاداری به اعتبار تحلیل تبدیل شد! 🎉",
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"برای تبدیل، حداقل {db.LOYALTY_POINTS_PER_CREDIT} امتیاز نیاز داری.",
+        )
+
+
+async def show_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    db.get_or_create_user(user.id, first_name=user.first_name or "")
+    user_row = db.get_user(user.id)
+
+    bot_username = context.bot.username
+    link = f"https://t.me/{bot_username}?start={user_row['referral_code']}"
+
+    await update.message.reply_text(
+        "🎁 <b>دعوت از دوستان</b>\n\n"
+        f"کد اختصاصی شما: <code>{user_row['referral_code']}</code>\n"
+        f"🔗 {link}\n\n"
+        f"وقتی دوستت با این لینک وارد بشه:\n"
+        f"• خودش {db.REFERRAL_FRIEND_BONUS_CREDITS} اعتبار تحلیل رایگان می‌گیره\n"
+        f"• تو {db.REFERRAL_REFERRER_BONUS_CREDITS} اعتبار تحلیل می‌گیری\n\n"
+        "🏆 <b>پاداش‌های پله‌ای</b> (بر اساس تعداد دعوت موفق):\n"
+        "• ۱ نفر → ۳ اعتبار اضافه\n"
+        "• ۵ نفر → ۲۰ اعتبار اضافه\n"
+        "• ۱۰ نفر → ۱ ماه پلن برنزی رایگان\n"
+        "• ۲۵ نفر → ۱ ماه پلن نقره‌ای رایگان\n"
+        "• ۵۰ نفر → ۳ ماه پلن نقره‌ای رایگان\n"
+        "• ۱۰۰ نفر → ۱ سال پلن نقره‌ای رایگان 🎉\n\n"
+        f"🎁 دوستان دعوت‌شده‌ی موفق شما تا الان: {user_row['successful_referrals']}\n"
+        f"💳 اعتبار فعلی شما: {user_row['analysis_credits']} تحلیل",
         parse_mode="HTML",
     )
 
 
 async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "💎 <b>نسخه‌ی حرفه‌ای</b>\n\n"
-        "مزایای نسخه‌ی حرفه‌ای نسبت به نسخه‌ی رایگان:\n\n"
-        "✔ تحلیل نامحدود (بدون محدودیت تعداد در ماه)\n"
-        "✔ خروجی PDF از هر گزارش، آماده برای چاپ یا اشتراک‌گذاری\n"
-        "✔ آرشیو کامل و بدون محدودیت پرونده‌ها\n"
-        "✔ اولویت در پردازش (پاسخ سریع‌تر در ساعات شلوغ)\n"
-        "✔ دسترسی زودهنگام به قابلیت‌های جدید\n\n"
-        "قیمت: به‌زودی اعلام می‌شه.\n"
-    )
+    user_id = update.effective_user.id
+    db.get_or_create_user(user_id)
+
+    lines = ["💎 <b>پلن‌های اشتراک ArchaeoLens</b>\n"]
+
+    for plan_id in plans.PLAN_ORDER:
+        plan = plans.PLANS[plan_id]
+        lines.append(f"\n<b>{plan['label']}</b>")
+        if plan_id == "explorer":
+            lines.append("رایگان")
+        else:
+            lines.append(
+                f"{plan['price_month']:,} تومان/ماه — یا {plan['price_year']:,} تومان/سال"
+            )
+        for feature in plan["features"]:
+            lines.append(f"✔ {feature}")
+
+    lines.append("\n\n💳 <b>بسته‌های اعتباری</b> (بدون نیاز به اشتراک ماهانه):")
+    for pack in plans.CREDIT_PACKS:
+        lines.append(f"• {pack['count']} پرونده — {pack['price']:,} تومان")
+
+    if db.is_within_first_purchase_window(user_id):
+        offer_plan = plans.PLANS[plans.FIRST_PURCHASE_PLAN]
+        discounted = round(
+            offer_plan["price_month"] * (100 - plans.FIRST_PURCHASE_DISCOUNT_PERCENT) / 100
+        )
+        lines.append(
+            f"\n\n🔥 <b>پیشنهاد ویژه‌ی خوش‌آمدگویی!</b>\n"
+            f"تا ۲۴ ساعت پس از عضویت، پلن {offer_plan['label']} رو با "
+            f"{plans.FIRST_PURCHASE_DISCOUNT_PERCENT}٪ تخفیف بگیر: "
+            f"فقط {discounted:,} تومان (به‌جای {offer_plan['price_month']:,} تومان) برای ماه اول!"
+        )
+
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🛒 خرید اشتراک", callback_data="sub|buy")]]
+        [[InlineKeyboardButton("🛒 خرید اشتراک / بسته", callback_data="sub|buy")]]
     )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="HTML", reply_markup=keyboard
+    )
 
 
 async def on_subscription_buy_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -247,6 +401,21 @@ async def on_encyclopedia_topic_selected(
 # جریان «پرونده جدید» — دریافت عکس
 # ---------------------------------------------------------------------------
 async def start_new_case(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    db.get_or_create_user(user_id, first_name=update.effective_user.first_name or "")
+
+    status = get_quota_status(user_id)
+    if not status["can_proceed"]:
+        await update.message.reply_text(
+            "⚠️ سهمیه‌ی پلن رایگان شما تموم شده و اعتبار اضافه‌ای هم نداری.\n\n"
+            "برای ادامه:\n"
+            f"• از «{BTN_SUBSCRIPTION}» یکی از پلن‌ها یا بسته‌های اعتباری رو ببین، یا\n"
+            f"• از «{BTN_INVITE}» دوستانت رو دعوت کن تا اعتبار رایگان بگیری.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    context.user_data["will_use_credit"] = status["will_use_credit"]
     context.user_data["photos"] = []
     context.user_data["environment"] = None
     context.user_data["size"] = None
@@ -256,6 +425,12 @@ async def start_new_case(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     keyboard = ReplyKeyboardMarkup(
         [[DONE_PHOTOS_BUTTON]], resize_keyboard=True, one_time_keyboard=False
     )
+    credit_note = ""
+    if status["will_use_credit"]:
+        credit_note = (
+            f"\n\n💳 توجه: سهمیه‌ی پلن فعلیت تموم شده؛ این تحلیل از اعتبار اضافه‌ت "
+            f"کم می‌شه ({status['credits']} اعتبار باقی‌مانده)."
+        )
     await update.message.reply_text(
         "📂 <b>پرونده جدید</b>\n\n"
         "برای بهترین نتیجه:\n"
@@ -263,7 +438,7 @@ async def start_new_case(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "✓ نور طبیعی (نه فلاش مستقیم)\n"
         "✓ چند زاویه‌ی مختلف\n"
         "✓ تصاویر واضح و بدون فیلتر\n\n"
-        "📷 عکس‌ها رو بفرست:",
+        f"📷 عکس‌ها رو بفرست:{credit_note}",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
@@ -512,7 +687,14 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
             f"جزئیات خطا برای دیباگ: {exc}"
         )
 
-    case_number = db.create_case(user_id, environment, size, material, notes, analysis)
+    used_credit = context.user_data.get("will_use_credit", False)
+    if used_credit:
+        db.consume_credit(user_id)
+
+    case_number = db.create_case(
+        user_id, environment, size, material, notes, analysis, used_credit=used_credit
+    )
+    db.mark_first_case_done(user_id)
 
     if ADMIN_CHAT_ID:
         await send_for_admin_review(
@@ -775,7 +957,9 @@ def main() -> None:
     application.add_handler(
         MessageHandler(filters.Regex(f"^{BTN_SUBSCRIPTION}$"), show_subscription)
     )
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_INVITE}$"), show_invite))
     application.add_handler(CallbackQueryHandler(on_subscription_buy_clicked, pattern=r"^sub\|buy$"))
+    application.add_handler(CallbackQueryHandler(on_loyalty_redeem_clicked, pattern=r"^loyalty\|redeem$"))
     application.add_handler(CallbackQueryHandler(on_encyclopedia_topic_selected, pattern=r"^enc\|"))
     application.add_handler(CommandHandler("mycases", my_cases))
 
