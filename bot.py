@@ -124,7 +124,7 @@ async def send_long_message(bot, chat_id: int, text: str) -> None:
 # ---------------------------------------------------------------------------
 BTN_NEW_CASE = "📂 پرونده جدید"
 BTN_MY_CASES = "📁 پرونده‌های من"
-BTN_ENCYCLOPEDIA = "📚 دانشنامه"
+BTN_PHOTO_GUIDE = "📷 راهنمای عکس گرفتن"
 BTN_ACCOUNT = "⚙️ حساب من"
 BTN_SUBSCRIPTION = "💎 اشتراک حرفه‌ای"
 BTN_INVITE = "🎁 دعوت دوستان"
@@ -132,11 +132,15 @@ BTN_INVITE = "🎁 دعوت دوستان"
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [BTN_NEW_CASE, BTN_MY_CASES],
-        [BTN_ENCYCLOPEDIA, BTN_ACCOUNT],
+        [BTN_PHOTO_GUIDE, BTN_ACCOUNT],
         [BTN_SUBSCRIPTION, BTN_INVITE],
     ],
     resize_keyboard=True,
 )
+
+CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL", "@archaeolens")
+CARD_NUMBER = os.getenv("CARD_NUMBER", "6037-0000-0000-0000")
+CARD_HOLDER_NAME = os.getenv("CARD_HOLDER_NAME", "نام صاحب حساب")
 
 # ---------------------------------------------------------------------------
 # مراحل مکالمه‌ی «پرونده جدید»
@@ -182,9 +186,60 @@ def build_inline_keyboard(options, prefix):
 # ---------------------------------------------------------------------------
 # دستورات و منوی سطح‌بالا
 # ---------------------------------------------------------------------------
+async def check_channel_membership(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status not in ("left", "kicked")
+    except Exception:  # noqa: BLE001
+        logger.exception("خطا در بررسی عضویت کانال (احتمالاً ربات ادمین کانال نیست)")
+        return False
+
+
+def build_join_gate_keyboard() -> InlineKeyboardMarkup:
+    channel_link = f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔗 عضویت در کانال", url=channel_link)],
+            [InlineKeyboardButton("✅ عضو شدم، بررسی کن", callback_data="joincheck")],
+        ]
+    )
+
+
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    referral_code = context.args[0] if context.args else None
+
+    if context.args:
+        context.user_data["pending_referral_code"] = context.args[0]
+
+    is_member = await check_channel_membership(context, user.id)
+    if not is_member:
+        await update.message.reply_text(
+            "👋 سلام! برای استفاده از ArchaeoLens، اول باید عضو کانال ما بشی:\n\n"
+            f"📢 {CHANNEL_USERNAME}\n\n"
+            "بعد از عضویت، دکمه‌ی «✅ عضو شدم» رو بزن.",
+            reply_markup=build_join_gate_keyboard(),
+        )
+        return
+
+    await complete_start(update.effective_chat.id, user, context)
+
+
+async def on_join_check_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+
+    is_member = await check_channel_membership(context, user.id)
+    if not is_member:
+        await query.answer("هنوز عضو کانال نشدی 🙁 اول عضو شو، بعد دوباره بزن.", show_alert=True)
+        return
+
+    await query.answer("✅ عضویت تأیید شد!")
+    await query.edit_message_text("✅ عضویت شما تأیید شد! خوش اومدی 🎉")
+    await complete_start(update.effective_chat.id, user, context)
+
+
+async def complete_start(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE) -> None:
+    referral_code = context.user_data.pop("pending_referral_code", None)
 
     _, referrer_id = db.get_or_create_user(
         user.id, first_name=user.first_name or "", referral_code=referral_code
@@ -205,9 +260,12 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:  # noqa: BLE001
             logger.exception("اطلاع‌رسانی پاداش دعوت به معرف با خطا مواجه شد")
 
-    await update.message.reply_text(
-        "🏛 <b>ArchaeoLens</b> — دستیار هوشمند تحلیل آثار تاریخی\n\n"
-        "👋 خوش اومدی! از منوی زیر انتخاب کن:",
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🏛 <b>ArchaeoLens</b> — دستیار هوشمند تحلیل آثار تاریخی\n\n"
+            "👋 خوش اومدی! از منوی زیر انتخاب کن:"
+        ),
         parse_mode="HTML",
         reply_markup=MAIN_MENU_KEYBOARD,
     )
@@ -363,38 +421,189 @@ async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def on_subscription_buy_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+
+    buttons = []
+    for plan_id in plans.PLAN_ORDER:
+        if plan_id == "explorer":
+            continue
+        plan = plans.PLANS[plan_id]
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{plan['label']} — ماهانه ({plan['price_month']:,} ت)",
+                    callback_data=f"buy|plan|{plan_id}|month",
+                )
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{plan['label']} — سالانه ({plan['price_year']:,} ت)",
+                    callback_data=f"buy|plan|{plan_id}|year",
+                )
+            ]
+        )
+    for idx, pack in enumerate(plans.CREDIT_PACKS):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"💳 بسته‌ی {pack['count']} پرونده — {pack['price']:,} ت",
+                    callback_data=f"buy|credit|{idx}",
+                )
+            ]
+        )
+
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=(
-            "🚧 پرداخت آنلاین هنوز فعال نشده (به‌زودی از طریق درگاه داخلی "
-            "زرین‌پال اضافه می‌شه). فعلاً نسخه‌ی رایگان بدون محدودیت در دسترسه."
-        ),
-    )
-
-
-async def show_encyclopedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    buttons = [
-        [InlineKeyboardButton(topic["title"], callback_data=f"enc|{key}")]
-        for key, topic in ENCYCLOPEDIA_TOPICS.items()
-    ]
-    await update.message.reply_text(
-        "📚 <b>دانشنامه</b>\n\nیکی از موضوعات زیر رو انتخاب کن:",
-        parse_mode="HTML",
+        text="کدوم رو می‌خوای بخری؟",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-async def on_encyclopedia_topic_selected(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def on_purchase_item_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    key = query.data.split("|", 1)[1]
-    topic = ENCYCLOPEDIA_TOPICS.get(key)
-    if topic:
+    parts = query.data.split("|")
+    user_id = update.effective_user.id
+
+    if parts[1] == "plan":
+        plan_id, period = parts[2], parts[3]
+        plan = plans.PLANS[plan_id]
+        price = plan["price_month"] if period == "month" else plan["price_year"]
+        days = 30 if period == "month" else 365
+
+        if (
+            plan_id == plans.FIRST_PURCHASE_PLAN
+            and period == "month"
+            and db.is_within_first_purchase_window(user_id)
+        ):
+            price = round(price * (100 - plans.FIRST_PURCHASE_DISCOUNT_PERCENT) / 100)
+
+        period_label = "ماهانه" if period == "month" else "سالانه"
+        description = f"پلن {plan['label']} ({period_label})"
+        target = {"type": "plan", "plan_id": plan_id, "days": days}
+    else:
+        idx = int(parts[2])
+        pack = plans.CREDIT_PACKS[idx]
+        price = pack["price"]
+        description = f"بسته‌ی {pack['count']} پرونده"
+        target = {"type": "credit", "count": pack["count"]}
+
+    pending_purchases = context.bot_data.setdefault("pending_purchases", {})
+    pending_purchases[user_id] = {"description": description, "amount": price, "target": target}
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            f"🧾 خرید: {description}\n"
+            f"💰 مبلغ قابل پرداخت: {price:,} تومان\n\n"
+            "لطفاً این مبلغ رو به شماره کارت زیر واریز کن:\n"
+            f"💳 {CARD_NUMBER}\n"
+            f"👤 به نام: {CARD_HOLDER_NAME}\n\n"
+            "بعد از واریز، عکس رسید/فیش واریزی رو همینجا (در همین چت) بفرست تا "
+            "برای تایید نهایی ارسال بشه."
+        ),
+    )
+
+
+async def receive_payment_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    pending_purchases = context.bot_data.get("pending_purchases", {})
+    purchase = pending_purchases.get(user_id)
+    if not purchase:
+        return  # این عکس ربطی به رسید پرداخت نداره؛ بی‌خیالش می‌شیم
+
+    photo = update.message.photo[-1]
+    receipt_path = f"/tmp/receipt_{user_id}.jpg"
+    try:
+        file = await photo.get_file()
+        await file.download_to_drive(receipt_path)
+    except Exception:  # noqa: BLE001
+        logger.exception("دانلود رسید پرداخت با خطا مواجه شد")
+        await update.message.reply_text("⚠️ دریافت عکس رسید با مشکل مواجه شد. لطفاً دوباره بفرست.")
+        return
+
+    await update.message.reply_text(
+        "✅ رسید دریافت شد و برای تایید نهایی ارسال شد. به‌زودی نتیجه رو اطلاع می‌دیم."
+    )
+
+    if ADMIN_CHAT_ID:
+        try:
+            with open(receipt_path, "rb") as f:
+                await context.bot.send_photo(
+                    chat_id=ADMIN_CHAT_ID,
+                    photo=f,
+                    caption=(
+                        "🧾 <b>درخواست خرید جدید</b>\n"
+                        f"کاربر: {update.effective_user.full_name} (آیدی: {user_id})\n"
+                        f"مورد: {purchase['description']}\n"
+                        f"مبلغ: {purchase['amount']:,} تومان"
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "✅ تایید و فعال‌سازی",
+                                    callback_data=f"purchase|approve|{user_id}",
+                                ),
+                                InlineKeyboardButton(
+                                    "❌ رد کردن", callback_data=f"purchase|reject|{user_id}"
+                                ),
+                            ]
+                        ]
+                    ),
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("ارسال رسید خرید به ادمین با خطا مواجه شد")
+
+    try:
+        os.remove(receipt_path)
+    except OSError:
+        pass
+
+
+async def on_purchase_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, action, user_id_str = query.data.split("|", 2)
+    user_id = int(user_id_str)
+
+    pending_purchases = context.bot_data.get("pending_purchases", {})
+    purchase = pending_purchases.get(user_id)
+    if not purchase:
+        await query.edit_message_caption(caption="⚠️ این درخواست قبلاً پردازش شده یا پیدا نشد.")
+        return
+
+    if action == "approve":
+        target = purchase["target"]
+        if target["type"] == "plan":
+            db.set_plan(user_id, target["plan_id"], target["days"])
+        else:
+            db.add_credits(user_id, target["count"])
+        db.add_loyalty_points(user_id, 100)
+        del pending_purchases[user_id]
+
         await context.bot.send_message(
-            chat_id=update.effective_chat.id, text=topic["text"], parse_mode="HTML"
+            chat_id=user_id,
+            text=f"✅ پرداخت شما تایید شد! «{purchase['description']}» با موفقیت فعال شد. 🎉",
         )
+        await query.edit_message_caption(caption="✅ تایید شد و برای کاربر فعال شد.")
+    else:
+        del pending_purchases[user_id]
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "❌ متاسفانه پرداخت شما تایید نشد. اگه فکر می‌کنید اشتباهی رخ داده، "
+                "دوباره تلاش کنید یا رسید واضح‌تری بفرستید."
+            ),
+        )
+        await query.edit_message_caption(caption="❌ رد شد.")
+
+
+async def show_photo_guide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    guide_text = ENCYCLOPEDIA_TOPICS["photo_tips"]["text"]
+    await update.message.reply_text(guide_text, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +1160,7 @@ def main() -> None:
     application.add_handler(new_case_conv)
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_MY_CASES}$"), my_cases))
     application.add_handler(
-        MessageHandler(filters.Regex(f"^{BTN_ENCYCLOPEDIA}$"), show_encyclopedia)
+        MessageHandler(filters.Regex(f"^{BTN_PHOTO_GUIDE}$"), show_photo_guide)
     )
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_ACCOUNT}$"), show_account))
     application.add_handler(
@@ -959,9 +1168,12 @@ def main() -> None:
     )
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_INVITE}$"), show_invite))
     application.add_handler(CallbackQueryHandler(on_subscription_buy_clicked, pattern=r"^sub\|buy$"))
+    application.add_handler(CallbackQueryHandler(on_purchase_item_selected, pattern=r"^buy\|"))
+    application.add_handler(CallbackQueryHandler(on_purchase_decision, pattern=r"^purchase\|"))
     application.add_handler(CallbackQueryHandler(on_loyalty_redeem_clicked, pattern=r"^loyalty\|redeem$"))
-    application.add_handler(CallbackQueryHandler(on_encyclopedia_topic_selected, pattern=r"^enc\|"))
+    application.add_handler(CallbackQueryHandler(on_join_check_clicked, pattern=r"^joincheck$"))
     application.add_handler(CommandHandler("mycases", my_cases))
+    application.add_handler(MessageHandler(filters.PHOTO, receive_payment_receipt))
 
     application.add_handler(CallbackQueryHandler(on_review_decision, pattern=r"^review\|"))
     if ADMIN_CHAT_ID:
