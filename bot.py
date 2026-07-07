@@ -370,10 +370,8 @@ async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     case_count = db.count_user_cases(user.id)
 
     plan = plans.PLANS[status["plan_id"]]
-    if status["plan_id"] == "explorer":
-        quota_line = f"📊 سهمیه‌ی باقی‌مانده: {status['remaining']} پرونده (مجموع)"
-    else:
-        quota_line = f"📊 سهمیه‌ی این ماه: {status['remaining']} پرونده باقی‌مانده"
+    quota_line = f"📊 سهمیه‌ی این «ماه» (۳۱ روز اخیر): {status['remaining']} پرونده باقی‌مانده"
+    if status["plan_id"] != "explorer":
         expires = user_row["plan_expires_at"]
         if expires:
             quota_line += f"\n📅 انقضای پلن: {expires[:10]}"
@@ -393,6 +391,7 @@ async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"💳 اعتبار اضافه: {status['credits']} تحلیل\n"
         f"📂 تعداد کل پرونده‌ها: {case_count}\n"
         f"🎁 دوستان دعوت‌شده‌ی موفق: {user_row['successful_referrals']}\n"
+        f"💰 موجودی کیف پول: {user_row['wallet_toman']:,} تومان\n"
         f"🏆 امتیاز وفاداری: {user_row['loyalty_points']}\n",
         parse_mode="HTML",
         reply_markup=keyboard,
@@ -428,18 +427,14 @@ async def show_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "🎁 <b>دعوت از دوستان</b>\n\n"
         f"کد اختصاصی شما: <code>{user_row['referral_code']}</code>\n"
         f"🔗 {link}\n\n"
-        f"وقتی دوستت با این لینک وارد بشه و <b>اولین پرونده‌ش رو کامل کنه</b>:\n"
-        f"• خودش {db.REFERRAL_FRIEND_BONUS_CREDITS} اعتبار تحلیل رایگان می‌گیره\n"
-        f"• تو {db.REFERRAL_REFERRER_BONUS_CREDITS} اعتبار تحلیل می‌گیری\n\n"
-        "🏆 <b>پاداش‌های پله‌ای</b> (بر اساس تعداد دعوت موفق):\n"
-        "• ۱ نفر → ۳ اعتبار اضافه\n"
-        "• ۵ نفر → ۲۰ اعتبار اضافه\n"
-        "• ۱۰ نفر → ۱ ماه پلن برنزی رایگان\n"
-        "• ۲۵ نفر → ۱ ماه پلن نقره‌ای رایگان\n"
-        "• ۵۰ نفر → ۳ ماه پلن نقره‌ای رایگان\n"
-        "• ۱۰۰ نفر → ۱ سال پلن نقره‌ای رایگان 🎉\n\n"
-        f"🎁 دوستان دعوت‌شده‌ی موفق شما تا الان: {user_row['successful_referrals']}\n"
-        f"💳 اعتبار فعلی شما: {user_row['analysis_credits']} تحلیل",
+        f"وقتی دوستت با این لینک وارد بشه، عضو کانال {CHANNEL_USERNAME} بشه، و "
+        "<b>اولین پرونده‌ش رو بسازه</b>:\n"
+        f"💰 <b>{db.REFERRAL_REWARD_TOMAN:,} تومان</b> به کیف پول شما اضافه می‌شه.\n\n"
+        f"⚠️ محدودیت‌ها: هر کاربر فقط یک‌بار (فقط برای اولین دوستِ دعوت‌کننده‌ش) "
+        f"پاداش می‌سازه، و هر معرف حداکثر {db.MAX_REFERRAL_REWARDS_PER_DAY} پاداش در روز می‌گیره.\n\n"
+        f"🎁 تعداد دعوت‌های پاداش‌دار شما تا الان: {user_row['successful_referrals']}\n"
+        f"💰 موجودی کیف پول شما: {user_row['wallet_toman']:,} تومان\n"
+        f"💳 اعتبار تحلیل رایگان شما: {user_row['analysis_credits']} تحلیل",
         parse_mode="HTML",
     )
 
@@ -992,21 +987,20 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
     )
 
     is_first_case = db.mark_first_case_done(user_id)
+
     if is_first_case:
-        referrer_id = db.grant_referral_reward_if_pending(user_id)
+        is_member = await check_channel_membership(context, user_id)
+        referrer_id = db.grant_referral_reward_if_eligible(user_id, is_channel_member=is_member)
         if referrer_id:
             try:
                 await context.bot.send_message(
                     chat_id=referrer_id,
                     text=(
                         "🎉 خبر خوب! یکی از دوستانی که دعوت کرده بودی اولین "
-                        "پرونده‌ش رو کامل کرد.\n"
-                        f"💳 {db.REFERRAL_REFERRER_BONUS_CREDITS} اعتبار تحلیل به حسابت اضافه شد."
+                        "پرونده‌ش رو ساخت.\n"
+                        f"💰 {db.REFERRAL_REWARD_TOMAN:,} تومان به کیف پولت اضافه شد."
                     ),
                 )
-                milestone_msg = db.check_and_grant_milestones(referrer_id)
-                if milestone_msg:
-                    await context.bot.send_message(chat_id=referrer_id, text=milestone_msg)
             except Exception:  # noqa: BLE001
                 logger.exception("ارسال پیام پاداش معرفی به معرف با خطا مواجه شد")
 
