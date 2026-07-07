@@ -68,12 +68,8 @@ def get_quota_status(user_id: int) -> dict:
         except ValueError:
             pass
 
-    if plan.get("lifetime_quota") is not None:
-        used = db.count_user_cases(user_id)
-        remaining = plan["lifetime_quota"] - used
-    else:
-        used = db.get_monthly_case_count(user_id)
-        remaining = plan["monthly_quota"] - used
+    used = db.get_current_cycle_case_count(user_id)
+    remaining = plan["monthly_quota"] - used
 
     credits = user["analysis_credits"] if user else 0
     remaining = max(0, remaining)
@@ -128,12 +124,14 @@ BTN_PHOTO_GUIDE = "📷 راهنمای عکس گرفتن"
 BTN_ACCOUNT = "⚙️ حساب من"
 BTN_SUBSCRIPTION = "💎 اشتراک حرفه‌ای"
 BTN_INVITE = "🎁 دعوت دوستان"
+BTN_SUPPORT = "🆘 پشتیبانی"
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [BTN_NEW_CASE, BTN_MY_CASES],
         [BTN_PHOTO_GUIDE, BTN_ACCOUNT],
         [BTN_SUBSCRIPTION, BTN_INVITE],
+        [BTN_SUPPORT],
     ],
     resize_keyboard=True,
 )
@@ -241,24 +239,9 @@ async def on_join_check_clicked(update: Update, context: ContextTypes.DEFAULT_TY
 async def complete_start(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE) -> None:
     referral_code = context.user_data.pop("pending_referral_code", None)
 
-    _, referrer_id = db.get_or_create_user(
+    db.get_or_create_user(
         user.id, first_name=user.first_name or "", referral_code=referral_code
     )
-
-    if referrer_id:
-        try:
-            await context.bot.send_message(
-                chat_id=referrer_id,
-                text=(
-                    "🎉 یکی از دوستانت با لینک دعوت تو وارد ربات شد!\n"
-                    f"💳 {db.REFERRAL_REFERRER_BONUS_CREDITS} اعتبار تحلیل به حسابت اضافه شد."
-                ),
-            )
-            milestone_msg = db.check_and_grant_milestones(referrer_id)
-            if milestone_msg:
-                await context.bot.send_message(chat_id=referrer_id, text=milestone_msg)
-        except Exception:  # noqa: BLE001
-            logger.exception("اطلاع‌رسانی پاداش دعوت به معرف با خطا مواجه شد")
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -291,6 +274,87 @@ async def my_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["awaiting_support_message"] = True
+    await update.message.reply_text(
+        "🆘 <b>پشتیبانی</b>\n\n"
+        "پیامت رو بنویس و بفرست؛ مستقیم برای تیم پشتیبانی ارسال می‌شه و "
+        "به‌زودی جواب می‌گیری.",
+        parse_mode="HTML",
+    )
+
+
+async def relay_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get("awaiting_support_message"):
+        return  # این پیام مربوط به درخواست پشتیبانی نیست
+
+    context.user_data["awaiting_support_message"] = False
+    user = update.effective_user
+
+    await update.message.reply_text(
+        "✅ پیامت ارسال شد. به‌زودی جواب می‌گیری."
+    )
+
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    "🆘 <b>پیام پشتیبانی جدید</b>\n"
+                    f"از طرف: {user.full_name} (آیدی: {user.id})\n\n"
+                    f"{update.message.text}"
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("✍️ پاسخ", callback_data=f"support|reply|{user.id}")]]
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("ارسال پیام پشتیبانی به ادمین با خطا مواجه شد")
+
+
+async def on_support_reply_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, _, user_id_str = query.data.split("|", 2)
+    user_id = int(user_id_str)
+
+    support_replies = context.bot_data.setdefault("awaiting_support_reply", {})
+    support_replies[update.effective_chat.id] = user_id
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="✍️ پاسخت رو بنویس؛ مستقیم برای کاربر ارسال می‌شه:",
+    )
+    if not ADMIN_CHAT_ID or update.effective_chat.id != ADMIN_CHAT_ID:
+        return  # این دستور فقط برای ادمین کار می‌کنه
+
+    stats = db.get_admin_stats()
+    pending_reviews = len(context.bot_data.get("pending_reviews", {}))
+    pending_purchases = len(context.bot_data.get("pending_purchases", {}))
+
+    plan_lines = "\n".join(
+        f"  • {plans.PLANS.get(plan_id, {'label': plan_id})['label']}: {count}"
+        for plan_id, count in stats["users_by_plan"].items()
+    )
+
+    text = (
+        "📊 <b>داشبورد آماری ArchaeoLens</b>\n\n"
+        f"👥 کل کاربران: {stats['total_users']}\n"
+        f"{plan_lines}\n\n"
+        f"📂 کل پرونده‌ها: {stats['total_cases']}\n"
+        f"📅 پرونده‌های امروز: {stats['cases_today']}\n"
+        f"📅 پرونده‌های ۳۰ روز اخیر: {stats['cases_last_30_days']}\n\n"
+        f"🎁 کل دعوت‌های پاداش‌دار: {stats['total_referrals']}\n\n"
+        f"💰 کل درآمد تاییدشده: {stats['total_revenue']:,} تومان\n"
+        f"💰 درآمد ۳۰ روز اخیر: {stats['revenue_last_30_days']:,} تومان\n"
+        f"🧾 تعداد خریدهای تاییدشده: {stats['total_purchases']}\n\n"
+        f"⏳ در انتظار تایید تحلیل: {pending_reviews}\n"
+        f"⏳ در انتظار تایید پرداخت: {pending_purchases}\n"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,7 +424,7 @@ async def show_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "🎁 <b>دعوت از دوستان</b>\n\n"
         f"کد اختصاصی شما: <code>{user_row['referral_code']}</code>\n"
         f"🔗 {link}\n\n"
-        f"وقتی دوستت با این لینک وارد بشه:\n"
+        f"وقتی دوستت با این لینک وارد بشه و <b>اولین پرونده‌ش رو کامل کنه</b>:\n"
         f"• خودش {db.REFERRAL_FRIEND_BONUS_CREDITS} اعتبار تحلیل رایگان می‌گیره\n"
         f"• تو {db.REFERRAL_REFERRER_BONUS_CREDITS} اعتبار تحلیل می‌گیری\n\n"
         "🏆 <b>پاداش‌های پله‌ای</b> (بر اساس تعداد دعوت موفق):\n"
@@ -582,6 +646,7 @@ async def on_purchase_decision(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             db.add_credits(user_id, target["count"])
         db.add_loyalty_points(user_id, 100)
+        db.log_purchase(user_id, purchase["description"], purchase["amount"])
         del pending_purchases[user_id]
 
         await context.bot.send_message(
@@ -612,6 +677,24 @@ async def show_photo_guide(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def start_new_case(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     db.get_or_create_user(user_id, first_name=update.effective_user.first_name or "")
+
+    count_today, last_time = db.get_recent_case_stats(user_id)
+    if count_today >= db.MAX_CASES_PER_DAY:
+        await update.message.reply_text(
+            "⚠️ به سقف تعداد پرونده‌ی امروز رسیدی. لطفاً فردا دوباره تلاش کن.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    if last_time:
+        seconds_since_last = (datetime.now(timezone.utc) - last_time).total_seconds()
+        if seconds_since_last < db.NEW_CASE_COOLDOWN_SECONDS:
+            wait_seconds = int(db.NEW_CASE_COOLDOWN_SECONDS - seconds_since_last)
+            await update.message.reply_text(
+                f"⏳ کمی صبر کن ({wait_seconds} ثانیه‌ی دیگه) و دوباره امتحان کن.",
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+            return ConversationHandler.END
 
     status = get_quota_status(user_id)
     if not status["can_proceed"]:
@@ -903,7 +986,25 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
     case_number = db.create_case(
         user_id, environment, size, material, notes, analysis, used_credit=used_credit
     )
-    db.mark_first_case_done(user_id)
+
+    is_first_case = db.mark_first_case_done(user_id)
+    if is_first_case:
+        referrer_id = db.grant_referral_reward_if_pending(user_id)
+        if referrer_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_id,
+                    text=(
+                        "🎉 خبر خوب! یکی از دوستانی که دعوت کرده بودی اولین "
+                        "پرونده‌ش رو کامل کرد.\n"
+                        f"💳 {db.REFERRAL_REFERRER_BONUS_CREDITS} اعتبار تحلیل به حسابت اضافه شد."
+                    ),
+                )
+                milestone_msg = db.check_and_grant_milestones(referrer_id)
+                if milestone_msg:
+                    await context.bot.send_message(chat_id=referrer_id, text=milestone_msg)
+            except Exception:  # noqa: BLE001
+                logger.exception("ارسال پیام پاداش معرفی به معرف با خطا مواجه شد")
 
     if ADMIN_CHAT_ID:
         await send_for_admin_review(
@@ -1067,10 +1168,23 @@ async def on_review_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admin_edit_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     admin_chat_id = update.effective_chat.id
+
+    support_replies = context.bot_data.get("awaiting_support_reply", {})
+    support_user_id = support_replies.get(admin_chat_id)
+    if support_user_id:
+        await context.bot.send_message(
+            chat_id=support_user_id,
+            text=f"📩 <b>پاسخ پشتیبانی:</b>\n\n{update.message.text}",
+            parse_mode="HTML",
+        )
+        support_replies.pop(admin_chat_id, None)
+        await update.message.reply_text("✅ پاسخ برای کاربر ارسال شد.")
+        return
+
     editing = context.bot_data.get("editing_case", {})
     case_number = editing.get(admin_chat_id)
     if not case_number:
-        return  # ادمین در حالت ویرایش نیست؛ این پیام مربوط به چیز دیگه‌ایه
+        return  # ادمین در حالت ویرایش/پاسخ نیست؛ این پیام مربوط به چیز دیگه‌ایه
 
     pending = context.bot_data.get("pending_reviews", {})
     review = pending.get(case_number)
@@ -1167,11 +1281,14 @@ def main() -> None:
         MessageHandler(filters.Regex(f"^{BTN_SUBSCRIPTION}$"), show_subscription)
     )
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_INVITE}$"), show_invite))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_SUPPORT}$"), show_support))
+    application.add_handler(CommandHandler("stats", show_admin_stats))
     application.add_handler(CallbackQueryHandler(on_subscription_buy_clicked, pattern=r"^sub\|buy$"))
     application.add_handler(CallbackQueryHandler(on_purchase_item_selected, pattern=r"^buy\|"))
     application.add_handler(CallbackQueryHandler(on_purchase_decision, pattern=r"^purchase\|"))
     application.add_handler(CallbackQueryHandler(on_loyalty_redeem_clicked, pattern=r"^loyalty\|redeem$"))
     application.add_handler(CallbackQueryHandler(on_join_check_clicked, pattern=r"^joincheck$"))
+    application.add_handler(CallbackQueryHandler(on_support_reply_clicked, pattern=r"^support\|reply\|"))
     application.add_handler(CommandHandler("mycases", my_cases))
     application.add_handler(MessageHandler(filters.PHOTO, receive_payment_receipt))
 
@@ -1187,6 +1304,10 @@ def main() -> None:
         logger.warning(
             "ADMIN_CHAT_ID تنظیم نشده؛ تحلیل‌ها بدون تایید مستقیماً برای کاربر ارسال می‌شن."
         )
+
+    # این هندلر باید بعد از هندلر مخصوص ادمین ثبت بشه، وگرنه پیام‌های ادمین
+    # (ویرایش تحلیل/پاسخ پشتیبانی) رو زودتر می‌قاپه.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_support_message))
 
     external_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 
