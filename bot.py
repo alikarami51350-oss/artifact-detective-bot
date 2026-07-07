@@ -139,6 +139,7 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL", "@archaeolens")
 CARD_NUMBER = os.getenv("CARD_NUMBER", "6037-0000-0000-0000")
 CARD_HOLDER_NAME = os.getenv("CARD_HOLDER_NAME", "نام صاحب حساب")
+REVIEW_TIMEOUT_MINUTES = int(os.getenv("REVIEW_TIMEOUT_MINUTES", "20"))
 
 # ---------------------------------------------------------------------------
 # مراحل مکالمه‌ی «پرونده جدید»
@@ -328,6 +329,9 @@ async def on_support_reply_clicked(update: Update, context: ContextTypes.DEFAULT
         chat_id=update.effective_chat.id,
         text="✍️ پاسخت رو بنویس؛ مستقیم برای کاربر ارسال می‌شه:",
     )
+
+
+async def show_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ADMIN_CHAT_ID or update.effective_chat.id != ADMIN_CHAT_ID:
         return  # این دستور فقط برای ادمین کار می‌کنه
 
@@ -1130,6 +1134,53 @@ async def send_for_admin_review(
         reply_markup=MAIN_MENU_KEYBOARD,
     )
 
+    if context.job_queue is not None:
+        context.job_queue.run_once(
+            auto_send_after_timeout,
+            when=REVIEW_TIMEOUT_MINUTES * 60,
+            data=case_number,
+            name=f"auto_send_{case_number}",
+        )
+
+
+async def auto_send_after_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """اگه ادمین ظرف مهلت مشخص تصمیم نگیره، گزارش خودکار (بدون تغییر) برای
+    کاربر ارسال می‌شه تا کاربر برای همیشه معطل نمونه."""
+    case_number = context.job.data
+    pending = context.bot_data.get("pending_reviews", {})
+    review = pending.get(case_number)
+    if not review:
+        return  # قبلاً تایید/ویرایش/رد شده
+
+    final_text = f"📁 شماره‌ی پرونده: {case_number}\n\n{review['draft']}"
+    await send_long_message(context.bot, review["user_chat_id"], final_text)
+    await context.bot.send_message(
+        chat_id=review["user_chat_id"],
+        text="برای شروع یه تحلیل جدید از منو انتخاب کن:",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
+    db.update_case_analysis(case_number, review["draft"])
+    del pending[case_number]
+
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    f"⏰ چون ظرف {REVIEW_TIMEOUT_MINUTES} دقیقه پاسخی ندادی، پرونده‌ی "
+                    f"{case_number} خودکار (بدون تغییر) برای کاربر ارسال شد."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("اطلاع‌رسانی ارسال خودکار به ادمین با خطا مواجه شد")
+
+
+def cancel_auto_send_job(context: ContextTypes.DEFAULT_TYPE, case_number: str) -> None:
+    if context.job_queue is None:
+        return
+    for job in context.job_queue.get_jobs_by_name(f"auto_send_{case_number}"):
+        job.schedule_removal()
+
 
 async def on_review_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1142,6 +1193,8 @@ async def on_review_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not review:
         await query.edit_message_text("⚠️ این پرونده قبلاً پردازش شده یا پیدا نشد.")
         return
+
+    cancel_auto_send_job(context, case_number)
 
     if action == "approve":
         final_text = f"📁 شماره‌ی پرونده: {case_number}\n\n{review['draft']}"
