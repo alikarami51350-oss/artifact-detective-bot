@@ -19,25 +19,14 @@ from datetime import datetime, timedelta, timezone
 
 DB_PATH = "cases.db"
 
-CYCLE_DAYS = 30  # طول هر «ماه» بر اساس این ربات
+CYCLE_DAYS = 31  # طول هر «ماه» بر اساس این ربات
 
-REFERRAL_FRIEND_BONUS_CREDITS = 2
-REFERRAL_REFERRER_BONUS_CREDITS = 3
+REFERRAL_REWARD_TOMAN = 30_000        # به ازای هر دعوت موفق، به کیف پول معرف اضافه می‌شه
+MAX_REFERRAL_REWARDS_PER_DAY = 5      # سقف تعداد پاداش دعوت در روز برای هر معرف
 
 # محدودیت‌های ضدسوءاستفاده
-MAX_REWARDED_REFERRALS_PER_DAY = 5   # سقف روزانه‌ی دعوت‌های پاداش‌دار برای هر معرف
 NEW_CASE_COOLDOWN_SECONDS = 60       # حداقل فاصله بین دو شروع «پرونده جدید»
 MAX_CASES_PER_DAY = 20               # سقف مطلق تعداد پرونده در روز (فارغ از پلن)
-
-# پاداش‌های پله‌ای بر اساس تعداد دعوت موفق (تجمعی)
-REFERRAL_MILESTONES = {
-    1: {"credits": 3},
-    5: {"credits": 20},
-    10: {"plan": "basic", "days": 30},
-    25: {"plan": "pro", "days": 30},
-    50: {"plan": "pro", "days": 90},
-    100: {"plan": "pro", "days": 365},
-}
 
 LOYALTY_POINTS = {
     "signup": 20,
@@ -76,6 +65,7 @@ def init_db() -> None:
                 referred_by INTEGER,
                 referral_code TEXT UNIQUE,
                 referral_rewarded INTEGER NOT NULL DEFAULT 0,
+                wallet_toman INTEGER NOT NULL DEFAULT 0,
                 plan TEXT NOT NULL DEFAULT 'explorer',
                 plan_expires_at TEXT,
                 analysis_credits INTEGER NOT NULL DEFAULT 0,
@@ -192,48 +182,49 @@ def get_or_create_user(user_id: int, first_name: str = "", referral_code: str = 
         return row
 
 
-def _count_referrer_rewards_today(conn, referrer_id: int) -> int:
-    day_start = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ).isoformat()
-    row = conn.execute(
-        "SELECT COUNT(*) FROM referral_reward_log WHERE referrer_id = ? AND rewarded_at >= ?",
-        (referrer_id, day_start),
-    ).fetchone()
-    return row[0] if row else 0
+def grant_referral_reward_if_eligible(user_id: int, is_channel_member: bool):
+    """فقط باید وقتی صدا زده بشه که کاربر (دعوت‌شده) *اولین* پرونده‌ش رو
+    ساخته. شرایط پاداش به معرف:
+    ۱. کاربر باید معرف داشته باشه (خودش با یک کد دعوت معتبر ثبت‌نام کرده باشه)
+    ۲. کاربر باید عضو کانال باشه (is_channel_member=True)
+    ۳. این کاربر قبلاً باعث پاداش گرفتن معرفش نشده باشه (referral_rewarded=0)
+    ۴. سقف روزانه‌ی پاداش معرف پر نشده باشه
 
+    خروجی: referrer_id اگه پاداش واقعاً داده شده، وگرنه None.
+    """
+    if not is_channel_member:
+        return None
 
-def grant_referral_reward_if_pending(user_id: int):
-    """وقتی کاربر اولین پرونده‌ش رو کامل می‌کنه صدا زده می‌شه. اگه با یک کد
-    دعوت معتبر ثبت‌نام کرده و هنوز پاداشی نگرفته، الان پاداش‌ها اعمال
-    می‌شن. خروجی: referrer_id (اگه پاداش معرف واقعاً اعمال شده باشه)، وگرنه
-    None."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
             "SELECT referred_by, referral_rewarded FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row or not row[0] or row[1]:
-            return None
+            return None  # معرف نداره، یا قبلاً باعث پاداش گرفتن معرفش شده
 
         referrer_id = row[0]
+        if referrer_id == user_id:
+            return None  # خود‌دعوتی؛ نباید اصلاً رخ بده ولی برای اطمینان چک می‌کنیم
+
+        day_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        rewards_today = conn.execute(
+            "SELECT COUNT(*) FROM referral_reward_log WHERE referrer_id = ? AND rewarded_at >= ?",
+            (referrer_id, day_start),
+        ).fetchone()[0]
+        if rewards_today >= MAX_REFERRAL_REWARDS_PER_DAY:
+            return None  # سقف روزانه‌ی معرف پر شده
 
         conn.execute(
-            "UPDATE users SET analysis_credits = analysis_credits + ?, "
-            "referral_rewarded = 1 WHERE user_id = ?",
-            (REFERRAL_FRIEND_BONUS_CREDITS, user_id),
+            "UPDATE users SET referral_rewarded = 1 WHERE user_id = ?", (user_id,)
         )
-
-        rewards_today = _count_referrer_rewards_today(conn, referrer_id)
-        if rewards_today >= MAX_REWARDED_REFERRALS_PER_DAY:
-            conn.commit()
-            return None  # سقف روزانه‌ی پاداش معرف پر شده؛ فقط دوست جدید پاداش گرفت
-
         conn.execute(
-            "UPDATE users SET analysis_credits = analysis_credits + ?, "
+            "UPDATE users SET wallet_toman = wallet_toman + ?, "
             "successful_referrals = successful_referrals + 1, "
             "loyalty_points = loyalty_points + ? WHERE user_id = ?",
-            (REFERRAL_REFERRER_BONUS_CREDITS, LOYALTY_POINTS["referral_success"], referrer_id),
+            (REFERRAL_REWARD_TOMAN, LOYALTY_POINTS["referral_success"], referrer_id),
         )
         conn.execute(
             "INSERT INTO referral_reward_log (referrer_id, rewarded_at) VALUES (?, ?)",
@@ -243,45 +234,9 @@ def grant_referral_reward_if_pending(user_id: int):
         return referrer_id
 
 
-def check_and_grant_milestones(user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT successful_referrals, milestones_claimed FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if row is None:
-            return None
-
-        count = row["successful_referrals"]
-        claimed = set(row["milestones_claimed"].split(",")) if row["milestones_claimed"] else set()
-
-        if count not in REFERRAL_MILESTONES or str(count) in claimed:
-            return None
-
-        reward = REFERRAL_MILESTONES[count]
-        description = None
-
-        if "credits" in reward:
-            conn.execute(
-                "UPDATE users SET analysis_credits = analysis_credits + ? WHERE user_id = ?",
-                (reward["credits"], user_id),
-            )
-            description = f"🎁 به‌خاطر رسیدن به {count} دعوت موفق، {reward['credits']} اعتبار تحلیل گرفتی!"
-        elif "plan" in reward:
-            _extend_plan(conn, user_id, reward["plan"], reward["days"])
-            description = (
-                f"🎁 به‌خاطر رسیدن به {count} دعوت موفق، {reward['days']} روز پلن "
-                f"{reward['plan']} برات فعال شد!"
-            )
-
-        claimed.add(str(count))
-        conn.execute(
-            "UPDATE users SET milestones_claimed = ? WHERE user_id = ?",
-            (",".join(sorted(claimed, key=int)), user_id),
-        )
-        conn.commit()
-        return description
+def get_wallet_toman(user_id: int) -> int:
+    user = get_user(user_id)
+    return user["wallet_toman"] if user else 0
 
 
 def _extend_plan(conn, user_id: int, plan: str, days: int) -> None:
