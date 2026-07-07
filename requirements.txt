@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks]>=22.4
+python-telegram-bot[webhooks,job-queue]>=22.4
 google-genai>=0.8.0
 Pillow>=10.0.0
 python-dotenv>=1.0.0
