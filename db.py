@@ -1,10 +1,13 @@
 """
 ماژول دیتابیس (SQLite) — پرونده‌ها، پلن‌های اشتراک، اعتبار تحلیل،
-امتیاز وفاداری، و سیستم دعوت دوستان.
+امتیاز وفاداری، سیستم دعوت دوستان، و آمار مدیریتی.
 
 نکته‌ی مهم: روی پلن رایگان Render، فضای دیسک "موقتیه" — یعنی هر بار که
 سرویس رو دوباره Deploy کنی، این فایل دیتابیس پاک می‌شه. برای نگه‌داری
 همیشگی، در آینده باید از یه دیتابیس بیرونی (Postgres/Supabase) استفاده کرد.
+
+تعریف «ماه» در کل ربات: نه ماه تقویمی، بلکه یک دوره‌ی ۳۰ روزه که از لحظه‌ی
+عضویت هر کاربر (joined_at) شروع می‌شه و هر ۳۰ روز یک‌بار تکرار می‌شه.
 """
 
 import random
@@ -16,11 +19,17 @@ from datetime import datetime, timedelta, timezone
 
 DB_PATH = "cases.db"
 
+CYCLE_DAYS = 30  # طول هر «ماه» بر اساس این ربات
+
 REFERRAL_FRIEND_BONUS_CREDITS = 2
 REFERRAL_REFERRER_BONUS_CREDITS = 3
 
+# محدودیت‌های ضدسوءاستفاده
+MAX_REWARDED_REFERRALS_PER_DAY = 5   # سقف روزانه‌ی دعوت‌های پاداش‌دار برای هر معرف
+NEW_CASE_COOLDOWN_SECONDS = 60       # حداقل فاصله بین دو شروع «پرونده جدید»
+MAX_CASES_PER_DAY = 20               # سقف مطلق تعداد پرونده در روز (فارغ از پلن)
+
 # پاداش‌های پله‌ای بر اساس تعداد دعوت موفق (تجمعی)
-# مقدار عددی = تعداد اعتبار تحلیل، رشته = یک پلن رایگان به مدت مشخص
 REFERRAL_MILESTONES = {
     1: {"credits": 3},
     5: {"credits": 20},
@@ -34,6 +43,7 @@ LOYALTY_POINTS = {
     "signup": 20,
     "first_case": 10,
     "referral_success": 50,
+    "purchase": 100,
     "feedback": 20,
 }
 LOYALTY_POINTS_PER_CREDIT = 10  # نرخ تبدیل امتیاز به اعتبار تحلیل
@@ -65,6 +75,7 @@ def init_db() -> None:
                 user_id INTEGER PRIMARY KEY,
                 referred_by INTEGER,
                 referral_code TEXT UNIQUE,
+                referral_rewarded INTEGER NOT NULL DEFAULT 0,
                 plan TEXT NOT NULL DEFAULT 'explorer',
                 plan_expires_at TEXT,
                 analysis_credits INTEGER NOT NULL DEFAULT 0,
@@ -73,6 +84,26 @@ def init_db() -> None:
                 milestones_claimed TEXT NOT NULL DEFAULT '',
                 first_case_done INTEGER NOT NULL DEFAULT 0,
                 joined_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referral_reward_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL,
+                rewarded_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS purchases_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                description TEXT,
+                amount INTEGER NOT NULL,
+                approved_at TEXT NOT NULL
             )
             """
         )
@@ -116,18 +147,18 @@ def get_user_by_referral_code(code: str):
 
 
 def get_or_create_user(user_id: int, first_name: str = "", referral_code: str = None):
-    """اگه کاربر وجود نداشته باشه می‌سازدش. اگه با یک کد دعوتِ معتبر ساخته بشه،
-    پاداش‌های فوری ثبت‌نام (به خودش و به معرفش) اعمال می‌شه.
+    """اگه کاربر وجود نداشته باشه می‌سازدش و رابطه‌ی معرف/دعوت‌شده رو ثبت
+    می‌کنه. توجه: هیچ پاداشی همین‌جا داده نمی‌شه — پاداش دعوت فقط بعد از
+    تکمیل اولین پرونده‌ی کاربر جدید فعال می‌شه (ضدسوءاستفاده با اکانت الکی).
 
-    خروجی: (user_row, referrer_id_or_None) — referrer_id فقط وقتی که همین
-    الان برای اولین بار با یک کد معتبر ساخته شده باشه پر می‌شه (برای اطلاع‌رسانی).
+    خروجی: user_row (اگه از قبل وجود داشته یا تازه ساخته شده، فرقی نداره)
     """
     now = datetime.now(timezone.utc).isoformat()
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
         if row is not None:
-            return row, None
+            return row
 
         referrer_row = None
         if referral_code:
@@ -139,52 +170,80 @@ def get_or_create_user(user_id: int, first_name: str = "", referral_code: str = 
                 referrer_row = None  # جلوگیری از دعوت خود فرد از خودش
 
         new_code = _generate_unique_referral_code(conn, first_name)
-        signup_credits = REFERRAL_FRIEND_BONUS_CREDITS if referrer_row else 0
         signup_points = LOYALTY_POINTS["signup"]
 
         conn.execute(
             """
             INSERT INTO users
-                (user_id, referred_by, referral_code, plan, analysis_credits,
-                 loyalty_points, joined_at)
-            VALUES (?, ?, ?, 'explorer', ?, ?, ?)
+                (user_id, referred_by, referral_code, loyalty_points, joined_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 user_id,
                 referrer_row["user_id"] if referrer_row else None,
                 new_code,
-                signup_credits,
                 signup_points,
                 now,
             ),
         )
         conn.commit()
 
-        referrer_id = None
-        if referrer_row is not None:
-            referrer_id = referrer_row["user_id"]
-            _grant_referral_rewards(conn, referrer_id)
-
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        return row, referrer_id
+        return row
 
 
-def _grant_referral_rewards(conn, referrer_id: int) -> None:
-    """اعتبار فوری معرف + بررسی پاداش‌های پله‌ای رو انجام می‌ده. باید داخل یک
-    اتصال دیتابیس باز (conn) صدا زده بشه."""
-    conn.execute(
-        "UPDATE users SET analysis_credits = analysis_credits + ?, "
-        "successful_referrals = successful_referrals + 1, "
-        "loyalty_points = loyalty_points + ? WHERE user_id = ?",
-        (REFERRAL_REFERRER_BONUS_CREDITS, LOYALTY_POINTS["referral_success"], referrer_id),
-    )
-    conn.commit()
+def _count_referrer_rewards_today(conn, referrer_id: int) -> int:
+    day_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM referral_reward_log WHERE referrer_id = ? AND rewarded_at >= ?",
+        (referrer_id, day_start),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def grant_referral_reward_if_pending(user_id: int):
+    """وقتی کاربر اولین پرونده‌ش رو کامل می‌کنه صدا زده می‌شه. اگه با یک کد
+    دعوت معتبر ثبت‌نام کرده و هنوز پاداشی نگرفته، الان پاداش‌ها اعمال
+    می‌شن. خروجی: referrer_id (اگه پاداش معرف واقعاً اعمال شده باشه)، وگرنه
+    None."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT referred_by, referral_rewarded FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row or not row[0] or row[1]:
+            return None
+
+        referrer_id = row[0]
+
+        conn.execute(
+            "UPDATE users SET analysis_credits = analysis_credits + ?, "
+            "referral_rewarded = 1 WHERE user_id = ?",
+            (REFERRAL_FRIEND_BONUS_CREDITS, user_id),
+        )
+
+        rewards_today = _count_referrer_rewards_today(conn, referrer_id)
+        if rewards_today >= MAX_REWARDED_REFERRALS_PER_DAY:
+            conn.commit()
+            return None  # سقف روزانه‌ی پاداش معرف پر شده؛ فقط دوست جدید پاداش گرفت
+
+        conn.execute(
+            "UPDATE users SET analysis_credits = analysis_credits + ?, "
+            "successful_referrals = successful_referrals + 1, "
+            "loyalty_points = loyalty_points + ? WHERE user_id = ?",
+            (REFERRAL_REFERRER_BONUS_CREDITS, LOYALTY_POINTS["referral_success"], referrer_id),
+        )
+        conn.execute(
+            "INSERT INTO referral_reward_log (referrer_id, rewarded_at) VALUES (?, ?)",
+            (referrer_id, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        return referrer_id
 
 
 def check_and_grant_milestones(user_id: int):
-    """بعد از هر دعوت موفق صدا زده می‌شه. اگه به یکی از آستانه‌های پله‌ای
-    رسیده باشه و قبلاً گرفته نشده، پاداششو می‌ده و توضیح متنی پاداش رو
-    برمی‌گردونه (برای اطلاع‌رسانی به کاربر)، وگرنه None."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -285,8 +344,6 @@ def add_loyalty_points(user_id: int, amount: int) -> None:
 
 
 def redeem_loyalty_points(user_id: int) -> int:
-    """تمام امتیازهای قابل‌تبدیل کاربر رو به اعتبار تبدیل می‌کنه و تعداد
-    اعتبار حاصل‌شده رو برمی‌گردونه (اگه امتیاز کافی نبود، 0)."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
             "SELECT loyalty_points FROM users WHERE user_id = ?", (user_id,)
@@ -334,15 +391,27 @@ def is_within_first_purchase_window(user_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# پرونده‌ها و محاسبه‌ی سهمیه‌ی ماهانه
+# پرونده‌ها و محاسبه‌ی سهمیه بر اساس چرخه‌ی ۳۰ روزه‌ی عضویت
 # ---------------------------------------------------------------------------
-def get_monthly_case_count(user_id: int) -> int:
+def _current_cycle_start(joined_at_iso: str) -> datetime:
+    joined = datetime.fromisoformat(joined_at_iso)
     now = datetime.now(timezone.utc)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    days_passed = (now - joined).days
+    cycle_number = days_passed // CYCLE_DAYS
+    return joined + timedelta(days=cycle_number * CYCLE_DAYS)
+
+
+def get_current_cycle_case_count(user_id: int) -> int:
+    """تعداد پرونده‌های ساخته‌شده در «ماه» جاری (۳۰ روز اخیر از عضویت، نه
+    ماه تقویمی) رو برمی‌گردونه."""
+    user = get_user(user_id)
+    if not user:
+        return 0
+    cycle_start = _current_cycle_start(user["joined_at"]).isoformat()
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM cases WHERE user_id = ? AND created_at >= ?",
-            (user_id, month_start),
+            (user_id, cycle_start),
         ).fetchone()
     return row[0] if row else 0
 
@@ -353,6 +422,23 @@ def count_user_cases(user_id: int) -> int:
             "SELECT COUNT(*) FROM cases WHERE user_id = ?", (user_id,)
         ).fetchone()
     return row[0] if row else 0
+
+
+def get_recent_case_stats(user_id: int):
+    """برای محدودیت ضدسوءاستفاده: (تعداد پرونده‌ی امروز، زمان آخرین پرونده)."""
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        count_today = conn.execute(
+            "SELECT COUNT(*) FROM cases WHERE user_id = ? AND created_at >= ?",
+            (user_id, day_start),
+        ).fetchone()[0]
+        last_row = conn.execute(
+            "SELECT created_at FROM cases WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    last_time = datetime.fromisoformat(last_row[0]) if last_row else None
+    return count_today, last_time
 
 
 def create_case(
@@ -427,3 +513,64 @@ def update_case_analysis(case_number: str, analysis: str) -> None:
             "UPDATE cases SET analysis = ? WHERE case_number = ?", (analysis, case_number)
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# لاگ خرید و آمار مدیریتی
+# ---------------------------------------------------------------------------
+def log_purchase(user_id: int, description: str, amount: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT INTO purchases_log (user_id, description, amount, approved_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, description, amount, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+
+
+def get_admin_stats() -> dict:
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    last_30_days = (now - timedelta(days=30)).isoformat()
+
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        total_cases = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+        cases_today = conn.execute(
+            "SELECT COUNT(*) FROM cases WHERE created_at >= ?", (today_start,)
+        ).fetchone()[0]
+        cases_last_30_days = conn.execute(
+            "SELECT COUNT(*) FROM cases WHERE created_at >= ?", (last_30_days,)
+        ).fetchone()[0]
+
+        plan_rows = conn.execute(
+            "SELECT plan, COUNT(*) FROM users GROUP BY plan"
+        ).fetchall()
+        users_by_plan = {row[0]: row[1] for row in plan_rows}
+
+        total_referrals = conn.execute(
+            "SELECT COUNT(*) FROM referral_reward_log"
+        ).fetchone()[0]
+
+        total_revenue = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM purchases_log"
+        ).fetchone()[0]
+        revenue_last_30_days = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM purchases_log WHERE approved_at >= ?",
+            (last_30_days,),
+        ).fetchone()[0]
+        total_purchases = conn.execute(
+            "SELECT COUNT(*) FROM purchases_log"
+        ).fetchone()[0]
+
+    return {
+        "total_users": total_users,
+        "total_cases": total_cases,
+        "cases_today": cases_today,
+        "cases_last_30_days": cases_last_30_days,
+        "users_by_plan": users_by_plan,
+        "total_referrals": total_referrals,
+        "total_revenue": total_revenue,
+        "revenue_last_30_days": revenue_last_30_days,
+        "total_purchases": total_purchases,
+    }
