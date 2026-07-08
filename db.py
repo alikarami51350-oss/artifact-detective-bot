@@ -54,7 +54,8 @@ def init_db() -> None:
                 material TEXT,
                 notes TEXT,
                 analysis TEXT,
-                used_credit INTEGER NOT NULL DEFAULT 0
+                used_credit INTEGER NOT NULL DEFAULT 0,
+                photo_file_ids TEXT
             )
             """
         )
@@ -460,6 +461,15 @@ def get_case_by_number(case_number: str, user_id: int):
             (case_number, user_id),
         ).fetchone()
     return row
+
+
+def update_case_photos(case_number: str, file_ids_csv: str) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE cases SET photo_file_ids = ? WHERE case_number = ?",
+            (file_ids_csv, case_number),
+        )
+        conn.commit()
 
 
 def update_case_analysis(case_number: str, analysis: str) -> None:
