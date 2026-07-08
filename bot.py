@@ -143,6 +143,8 @@ CARD_NUMBER = os.getenv("CARD_NUMBER", "6037-0000-0000-0000")
 CARD_HOLDER_NAME = os.getenv("CARD_HOLDER_NAME", "نام صاحب حساب")
 REVIEW_TIMEOUT_MINUTES = int(os.getenv("REVIEW_TIMEOUT_MINUTES", "20"))
 DASHBOARD_SECRET_KEY = os.getenv("DASHBOARD_SECRET_KEY", "")
+_archive_channel_raw = os.getenv("ARCHIVE_CHANNEL_ID", "").strip()
+ARCHIVE_CHANNEL_ID = int(_archive_channel_raw) if _archive_channel_raw else None
 
 # ---------------------------------------------------------------------------
 # مراحل مکالمه‌ی «پرونده جدید»
@@ -270,14 +272,51 @@ async def my_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     lines = ["📁 <b>آخرین پرونده‌های شما:</b>\n"]
+    buttons = []
     for case in cases:
         date_str = case["created_at"][:10]
         lines.append(
             f"🔖 <b>{case['case_number']}</b> — {date_str}\n"
             f"   محیط: {case['environment']} | اندازه: {case['size']} | جنس: {case['material']}\n"
         )
+        buttons.append(
+            [InlineKeyboardButton(f"🔍 جزئیات {case['case_number']}", callback_data=f"caseview|{case['case_number']}")]
+        )
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def on_case_view_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    case_number = query.data.split("|", 1)[1]
+    user_id = update.effective_user.id
+
+    case = db.get_case_by_number(case_number, user_id)
+    if not case:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id, text="⚠️ این پرونده پیدا نشد."
+        )
+        return
+
+    full_text = (
+        f"📁 شماره‌ی پرونده: {case['case_number']}\n"
+        f"📅 تاریخ: {case['created_at'][:10]}\n"
+        f"📍 محیط: {case['environment']} | اندازه: {case['size']} | جنس: {case['material']}\n\n"
+        f"{case['analysis']}"
+    )
+    await send_long_message(context.bot, update.effective_chat.id, full_text)
+
+    photo_ids = (case["photo_file_ids"] or "").split(",") if case["photo_file_ids"] else []
+    photo_ids = [pid for pid in photo_ids if pid]
+    if photo_ids:
+        try:
+            media = [InputMediaPhoto(pid) for pid in photo_ids]
+            await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
+        except Exception:  # noqa: BLE001
+            logger.exception("ارسال دوباره‌ی عکس‌های آرشیوشده با خطا مواجه شد")
 
 
 async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -776,6 +815,8 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return COLLECTING_PHOTOS
 
     photos.append(file_path)
+    file_ids = context.user_data.setdefault("photo_file_ids", [])
+    file_ids.append(photo.file_id)
     await update.message.reply_text(
         f"✔ تصویر {len(photos)} دریافت شد.\n"
         f"({len(photos)}/۸، حداقل ۲ عکس لازمه)"
@@ -900,6 +941,32 @@ async def receive_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 # ---------------------------------------------------------------------------
 # تحلیل نهایی با Gemini + نمایش پیشرفت
 # ---------------------------------------------------------------------------
+async def archive_case_photos(
+    context: ContextTypes.DEFAULT_TYPE, case_number: str, user_id: int, file_ids: list
+) -> None:
+    """عکس‌های پرونده رو (با استفاده از همون file_id، بدون آپلود دوباره) توی
+    کانال آرشیو ذخیره می‌کنه و شناسه‌ی جدید هرکدوم رو توی دیتابیس ثبت می‌کنه.
+    این‌طوری فضای دیسک هاست اصلاً درگیر نمی‌شه — خود تلگرام فضای ذخیره‌سازی
+    عکس‌ها رو (رایگان و تقریباً نامحدود) تامین می‌کنه."""
+    if not ARCHIVE_CHANNEL_ID or not file_ids:
+        return
+
+    archived_ids = []
+    for file_id in file_ids:
+        try:
+            sent = await context.bot.send_photo(
+                chat_id=ARCHIVE_CHANNEL_ID,
+                photo=file_id,
+                caption=f"📁 {case_number} | 👤 آیدی کاربر: {user_id}",
+            )
+            archived_ids.append(sent.photo[-1].file_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("آرشیو کردن عکس در کانال با خطا مواجه شد")
+
+    if archived_ids:
+        db.update_case_photos(case_number, ",".join(archived_ids))
+
+
 async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     photos = context.user_data.get("photos", [])
     environment = context.user_data.get("environment", "نامشخص")
@@ -988,6 +1055,8 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
     case_number = db.create_case(
         user_id, environment, size, material, notes, analysis, used_credit=used_credit
     )
+
+    await archive_case_photos(context, case_number, user_id, context.user_data.get("photo_file_ids", []))
 
     is_first_case = db.mark_first_case_done(user_id)
 
@@ -1338,6 +1407,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(on_purchase_decision, pattern=r"^purchase\|"))
     application.add_handler(CallbackQueryHandler(on_loyalty_redeem_clicked, pattern=r"^loyalty\|redeem$"))
     application.add_handler(CallbackQueryHandler(on_join_check_clicked, pattern=r"^joincheck$"))
+    application.add_handler(CallbackQueryHandler(on_case_view_clicked, pattern=r"^caseview\|"))
     application.add_handler(CallbackQueryHandler(on_support_reply_clicked, pattern=r"^support\|reply\|"))
     application.add_handler(CommandHandler("mycases", my_cases))
     application.add_handler(MessageHandler(filters.PHOTO, receive_payment_receipt))
