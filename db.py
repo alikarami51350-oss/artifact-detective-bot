@@ -483,6 +483,37 @@ def log_purchase(user_id: int, description: str, amount: int) -> None:
         conn.commit()
 
 
+def get_recent_cases_all(limit: int = 50):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT case_number, user_id, created_at, environment, size, material, used_credit
+            FROM cases
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return rows
+
+
+def get_all_users(limit: int = 200):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT user_id, plan, plan_expires_at, analysis_credits, wallet_toman,
+                   successful_referrals, loyalty_points, joined_at
+            FROM users
+            ORDER BY joined_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return rows
+
+
 def get_admin_stats() -> dict:
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
