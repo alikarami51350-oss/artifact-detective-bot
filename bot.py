@@ -12,6 +12,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
+from aiohttp import web
 from dotenv import load_dotenv
 from google import genai
 from PIL import Image
@@ -33,6 +34,7 @@ from telegram.ext import (
     filters,
 )
 
+import dashboard
 import db
 import plans
 import quality
@@ -140,6 +142,7 @@ CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL", "@archaeolens")
 CARD_NUMBER = os.getenv("CARD_NUMBER", "6037-0000-0000-0000")
 CARD_HOLDER_NAME = os.getenv("CARD_HOLDER_NAME", "نام صاحب حساب")
 REVIEW_TIMEOUT_MINUTES = int(os.getenv("REVIEW_TIMEOUT_MINUTES", "20"))
+DASHBOARD_SECRET_KEY = os.getenv("DASHBOARD_SECRET_KEY", "")
 
 # ---------------------------------------------------------------------------
 # مراحل مکالمه‌ی «پرونده جدید»
@@ -1359,18 +1362,55 @@ def main() -> None:
     external_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 
     if external_hostname:
-        port = int(os.getenv("PORT", "10000"))
-        webhook_url = f"https://{external_hostname}/{TELEGRAM_TOKEN}"
-        logger.info("ربات در حالت Webhook روی پورت %s اجرا می‌شه...", port)
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=TELEGRAM_TOKEN,
-            webhook_url=webhook_url,
-        )
+        asyncio.run(run_webhook_and_dashboard_server(application, external_hostname))
     else:
         logger.info("ربات در حالت Polling (تست محلی) اجرا می‌شه...")
         application.run_polling()
+
+
+async def handle_dashboard_request(request: "web.Request") -> "web.Response":
+    key = request.query.get("key", "")
+    if not DASHBOARD_SECRET_KEY or key != DASHBOARD_SECRET_KEY:
+        return web.Response(text="⛔ دسترسی غیرمجاز", status=403)
+
+    stats = db.get_admin_stats()
+    cases = db.get_recent_cases_all(50)
+    users = db.get_all_users(200)
+    html_content = dashboard.render_dashboard_html(stats, cases, users)
+    return web.Response(text=html_content, content_type="text/html")
+
+
+async def run_webhook_and_dashboard_server(application, external_hostname: str) -> None:
+    """یک سرور aiohttp واحد اجرا می‌کنه که هم وبهوک تلگرام و هم داشبورد
+    مدیریتی رو سرویس می‌ده (چون Render فقط یک پورت عمومی می‌ده)."""
+    port = int(os.getenv("PORT", "10000"))
+    webhook_path = f"/{TELEGRAM_TOKEN}"
+    webhook_url = f"https://{external_hostname}{webhook_path}"
+
+    await application.initialize()
+    await application.bot.set_webhook(url=webhook_url)
+    await application.start()
+
+    async def telegram_webhook_handler(request: "web.Request") -> "web.Response":
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.update_queue.put(update)
+        return web.Response(status=200)
+
+    web_app = web.Application()
+    web_app.router.add_post(webhook_path, telegram_webhook_handler)
+    web_app.router.add_get("/dashboard", handle_dashboard_request)
+
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logger.info(
+        "سرور (تلگرام + داشبورد) روی پورت %s اجرا شد. داشبورد: /dashboard?key=***", port
+    )
+
+    await asyncio.Event().wait()  # برای همیشه در حال اجرا بمونه
 
 
 if __name__ == "__main__":
