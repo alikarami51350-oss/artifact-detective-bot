@@ -398,6 +398,7 @@ def get_recent_case_stats(user_id: int):
 
 
 def create_case(
+    case_number: str,
     user_id: int,
     environment: str,
     size: str,
@@ -406,35 +407,41 @@ def create_case(
     analysis: str,
     used_credit: bool = False,
 ) -> str:
-    """یک پرونده‌ی جدید می‌سازه و شماره‌ی پرونده (مثل AL-2026-000123) رو برمی‌گردونه."""
+    """یک پرونده‌ی جدید با شماره‌ی پرونده‌ی از پیش‌ساخته‌شده (مثل
+    AK2026/07/09:10:46:30) ذخیره می‌کنه. اگه به‌ندرت تصادفاً تکراری باشه
+    (مثلاً دو درخواست در یک ثانیه‌ی دقیق)، خودکار یه پسوند بهش اضافه می‌کنه
+    تا یکتا بمونه. شماره‌ی پرونده‌ی نهایی (احتمالاً با پسوند) رو برمی‌گردونه."""
     now = datetime.now(timezone.utc)
+    final_case_number = case_number
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO cases
-                (case_number, user_id, created_at, environment, size, material,
-                 notes, analysis, used_credit)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "",
-                user_id,
-                now.isoformat(),
-                environment,
-                size,
-                material,
-                notes,
-                analysis,
-                1 if used_credit else 0,
-            ),
-        )
-        case_id = cursor.lastrowid
-        case_number = f"AL-{now.year}-{case_id:06d}"
-        conn.execute(
-            "UPDATE cases SET case_number = ? WHERE id = ?", (case_number, case_id)
-        )
-        conn.commit()
-    return case_number
+        attempt = 0
+        while True:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO cases
+                        (case_number, user_id, created_at, environment, size, material,
+                         notes, analysis, used_credit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        final_case_number,
+                        user_id,
+                        now.isoformat(),
+                        environment,
+                        size,
+                        material,
+                        notes,
+                        analysis,
+                        1 if used_credit else 0,
+                    ),
+                )
+                conn.commit()
+                break
+            except sqlite3.IntegrityError:
+                attempt += 1
+                final_case_number = f"{case_number}-{attempt}"
+    return final_case_number
 
 
 def get_user_cases(user_id: int, limit: int = 10):
