@@ -10,7 +10,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -928,19 +928,65 @@ async def on_notes_skipped(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     context.user_data["notes"] = "—"
     await query.edit_message_text("📝 توضیح اضافه: (بدون توضیح) ✅")
-    await analyze_and_reply(update.effective_chat.id, update.effective_user.id, context)
+    await analyze_and_reply(update.effective_chat.id, update.effective_user, context)
     return ConversationHandler.END
 
 
 async def receive_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["notes"] = update.message.text
-    await analyze_and_reply(update.effective_chat.id, update.effective_user.id, context)
+    await analyze_and_reply(update.effective_chat.id, update.effective_user, context)
     return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
 # تحلیل نهایی با Gemini + نمایش پیشرفت
 # ---------------------------------------------------------------------------
+def build_case_number(tg_user) -> str:
+    """شماره‌ی پرونده رو به‌صورت «حروف اول نام + تاریخ:ساعت:دقیقه:ثانیه»
+    (به وقت ایران) می‌سازه، مثلاً AK2026/07/09:10:46:30"""
+    first = (tg_user.first_name or "").strip()
+    last = (tg_user.last_name or "").strip()
+    if first and last:
+        initials = (first[0] + last[0]).upper()
+    elif len(first) >= 2:
+        initials = first[:2].upper()
+    elif first:
+        initials = (first[0] + "X").upper()
+    else:
+        initials = "UN"
+
+    tehran_tz = timezone(timedelta(hours=3, minutes=30))
+    now = datetime.now(tehran_tz)
+    return f"{initials}{now.strftime('%Y/%m/%d:%H:%M:%S')}"
+
+
+async def archive_case_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    case_number: str,
+    user_id: int,
+    environment: str,
+    size: str,
+    material: str,
+    notes: str,
+    analysis: str,
+) -> None:
+    """متن کامل تحلیل رو هم (علاوه بر عکس‌ها) توی کانال آرشیو ذخیره می‌کنه."""
+    if not ARCHIVE_CHANNEL_ID:
+        return
+
+    text = (
+        f"📁 {case_number}\n"
+        f"👤 آیدی تلگرام کاربر: {user_id}\n"
+        f"📍 محیط: {environment} | اندازه: {size} | جنس: {material}\n"
+        f"📝 توضیح کاربر: {notes}\n\n"
+        f"{analysis}"
+    )
+    try:
+        await send_long_message(context.bot, ARCHIVE_CHANNEL_ID, text)
+    except Exception:  # noqa: BLE001
+        logger.exception("ارسال متن تحلیل به کانال آرشیو با خطا مواجه شد")
+
+
 async def archive_case_photos(
     context: ContextTypes.DEFAULT_TYPE, case_number: str, user_id: int, file_ids: list
 ) -> None:
@@ -967,7 +1013,8 @@ async def archive_case_photos(
         db.update_case_photos(case_number, ",".join(archived_ids))
 
 
-async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def analyze_and_reply(chat_id: int, tg_user, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = tg_user.id
     photos = context.user_data.get("photos", [])
     environment = context.user_data.get("environment", "نامشخص")
     size = context.user_data.get("size", "نامشخص")
@@ -1052,11 +1099,22 @@ async def analyze_and_reply(chat_id: int, user_id: int, context: ContextTypes.DE
     if used_credit:
         db.consume_credit(user_id)
 
+    generated_case_number = build_case_number(tg_user)
     case_number = db.create_case(
-        user_id, environment, size, material, notes, analysis, used_credit=used_credit
+        generated_case_number,
+        user_id,
+        environment,
+        size,
+        material,
+        notes,
+        analysis,
+        used_credit=used_credit,
     )
 
     await archive_case_photos(context, case_number, user_id, context.user_data.get("photo_file_ids", []))
+    await archive_case_text(
+        context, case_number, user_id, environment, size, material, notes, analysis
+    )
 
     is_first_case = db.mark_first_case_done(user_id)
 
