@@ -373,6 +373,95 @@ async def on_support_reply_clicked(update: Update, context: ContextTypes.DEFAULT
     )
 
 
+async def admin_grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ADMIN_CHAT_ID or update.effective_chat.id != ADMIN_CHAT_ID:
+        return  # این دستور فقط برای ادمین کار می‌کنه
+
+    args = context.args
+    usage = (
+        "📝 <b>راهنمای دستور /grant</b>\n\n"
+        "برای اعتبار تحلیل:\n"
+        "<code>/grant آیدی_کاربر credit تعداد</code>\n\n"
+        "برای کیف پول تومانی:\n"
+        "<code>/grant آیدی_کاربر wallet مبلغ</code>\n\n"
+        "برای فعال‌سازی پلن:\n"
+        "<code>/grant آیدی_کاربر plan basic|pro|expert تعداد_روز</code>\n\n"
+        "مثال: <code>/grant 123456789 plan pro 30</code>"
+    )
+
+    if len(args) < 3:
+        await update.message.reply_text(usage, parse_mode="HTML")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ آیدی کاربر باید یک عدد باشه.")
+        return
+
+    if not db.user_exists(target_user_id):
+        await update.message.reply_text(
+            "⚠️ این کاربر هنوز تو دیتابیس ثبت نشده (باید حداقل یک‌بار /start زده باشه)."
+        )
+        return
+
+    kind = args[1].lower()
+
+    if kind == "credit":
+        try:
+            amount = int(args[2])
+        except ValueError:
+            await update.message.reply_text("⚠️ تعداد اعتبار باید عدد باشه.")
+            return
+        db.add_credits(target_user_id, amount)
+        result_text = f"✅ {amount} اعتبار تحلیل به کاربر {target_user_id} اضافه شد."
+        user_notice = f"🎁 {amount} اعتبار تحلیل رایگان به حسابت اضافه شد!"
+
+    elif kind == "wallet":
+        try:
+            amount = int(args[2])
+        except ValueError:
+            await update.message.reply_text("⚠️ مبلغ باید عدد باشه (به تومان).")
+            return
+        db.add_wallet_toman(target_user_id, amount)
+        result_text = f"✅ {amount:,} تومان به کیف‌پول کاربر {target_user_id} اضافه شد."
+        user_notice = f"🎁 {amount:,} تومان به کیف‌پولت اضافه شد!"
+
+    elif kind == "plan":
+        if len(args) < 4:
+            await update.message.reply_text(
+                "⚠️ برای پلن باید تعداد روز رو هم بدی:\n"
+                "/grant آیدی_کاربر plan basic|pro|expert تعداد_روز"
+            )
+            return
+        plan_id = args[2].lower()
+        if plan_id not in plans.PLANS or plan_id == "explorer":
+            await update.message.reply_text(
+                f"⚠️ پلن نامعتبره. گزینه‌ها: {', '.join(p for p in plans.PLANS if p != 'explorer')}"
+            )
+            return
+        try:
+            days = int(args[3])
+        except ValueError:
+            await update.message.reply_text("⚠️ تعداد روز باید عدد باشه.")
+            return
+        db.set_plan(target_user_id, plan_id, days)
+        plan_label = plans.PLANS[plan_id]["label"]
+        result_text = f"✅ پلن {plan_label} برای {days} روز به کاربر {target_user_id} فعال شد."
+        user_notice = f"🎁 پلن {plan_label} برای {days} روز برات فعال شد!"
+
+    else:
+        await update.message.reply_text("⚠️ نوع نامعتبره. باید یکی از credit / wallet / plan باشه.")
+        return
+
+    await update.message.reply_text(result_text)
+
+    try:
+        await context.bot.send_message(chat_id=target_user_id, text=user_notice)
+    except Exception:  # noqa: BLE001
+        logger.exception("اطلاع‌رسانی تغییر دستی حساب به کاربر با خطا مواجه شد")
+
+
 async def show_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ADMIN_CHAT_ID or update.effective_chat.id != ADMIN_CHAT_ID:
         return  # این دستور فقط برای ادمین کار می‌کنه
@@ -401,6 +490,136 @@ async def show_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"⏳ در انتظار تایید پرداخت: {pending_purchases}\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+def _is_admin(update: Update) -> bool:
+    return bool(ADMIN_CHAT_ID) and update.effective_chat.id == ADMIN_CHAT_ID
+
+
+async def cmd_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("فرمت درست: /userinfo آیدی_کاربر")
+        return
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("آیدی کاربر باید یک عدد باشه.")
+        return
+
+    user = db.get_user(user_id)
+    if not user:
+        await update.message.reply_text("⚠️ این کاربر پیدا نشد.")
+        return
+
+    case_count = db.count_user_cases(user_id)
+    plan_expiry = f" (تا {user['plan_expires_at'][:10]})" if user["plan_expires_at"] else ""
+    text = (
+        f"👤 <b>اطلاعات کاربر {user_id}</b>\n\n"
+        f"🔖 کد دعوت: <code>{user['referral_code']}</code>\n"
+        f"💎 پلن: {user['plan']}{plan_expiry}\n"
+        f"💳 اعتبار اضافه: {user['analysis_credits']}\n"
+        f"💰 کیف پول: {user['wallet_toman']:,} تومان\n"
+        f"🎁 دعوت موفق: {user['successful_referrals']}\n"
+        f"🏆 امتیاز وفاداری: {user['loyalty_points']}\n"
+        f"📂 تعداد پرونده: {case_count}\n"
+        f"📅 عضویت: {user['joined_at'][:10]}\n"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_grantplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "فرمت درست: /grantplan آیدی_کاربر پلن تعداد_روز\n"
+            f"پلن‌های معتبر: {', '.join(plans.PLANS.keys())}\n"
+            "مثال: /grantplan 123456789 pro 30"
+        )
+        return
+    try:
+        user_id = int(context.args[0])
+        plan_id = context.args[1].lower()
+        days = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("فرمت درست نیست؛ آیدی و تعداد روز باید عدد باشن.")
+        return
+    if plan_id not in plans.PLANS:
+        await update.message.reply_text(f"پلن نامعتبر. گزینه‌ها: {', '.join(plans.PLANS.keys())}")
+        return
+    if not db.get_user(user_id):
+        await update.message.reply_text("⚠️ این کاربر هنوز با ربات شروع نکرده؛ نمی‌شه پلن دادش.")
+        return
+
+    db.set_plan(user_id, plan_id, days)
+    await update.message.reply_text(
+        f"✅ پلن «{plans.PLANS[plan_id]['label']}» برای {days} روز به کاربر {user_id} داده شد."
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"🎁 پلن «{plans.PLANS[plan_id]['label']}» برای {days} روز برات فعال شد!",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("اطلاع‌رسانی پلن هدیه‌ای به کاربر با خطا مواجه شد")
+
+
+async def cmd_grantcredit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "فرمت درست: /grantcredit آیدی_کاربر تعداد\nمثال: /grantcredit 123456789 5"
+        )
+        return
+    try:
+        user_id = int(context.args[0])
+        amount = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("فرمت درست نیست؛ آیدی و تعداد باید عدد باشن.")
+        return
+    if not db.get_user(user_id):
+        await update.message.reply_text("⚠️ این کاربر هنوز با ربات شروع نکرده.")
+        return
+
+    db.add_credits(user_id, amount)
+    await update.message.reply_text(f"✅ {amount} اعتبار تحلیل به کاربر {user_id} اضافه شد.")
+    try:
+        await context.bot.send_message(
+            chat_id=user_id, text=f"🎁 {amount} اعتبار تحلیل رایگان بهت هدیه داده شد!"
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("اطلاع‌رسانی اعتبار هدیه‌ای به کاربر با خطا مواجه شد")
+
+
+async def cmd_grantwallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "فرمت درست: /grantwallet آیدی_کاربر مبلغ_تومان\nمثال: /grantwallet 123456789 50000"
+        )
+        return
+    try:
+        user_id = int(context.args[0])
+        amount = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("فرمت درست نیست؛ آیدی و مبلغ باید عدد باشن.")
+        return
+    if not db.get_user(user_id):
+        await update.message.reply_text("⚠️ این کاربر هنوز با ربات شروع نکرده.")
+        return
+
+    db.add_wallet_toman(user_id, amount)
+    await update.message.reply_text(f"✅ {amount:,} تومان به کیف‌پول کاربر {user_id} اضافه شد.")
+    try:
+        await context.bot.send_message(
+            chat_id=user_id, text=f"🎁 {amount:,} تومان به کیف‌پولت اضافه شد!"
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("اطلاع‌رسانی کیف‌پول هدیه‌ای به کاربر با خطا مواجه شد")
 
 
 async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1460,6 +1679,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_INVITE}$"), show_invite))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_SUPPORT}$"), show_support))
     application.add_handler(CommandHandler("stats", show_admin_stats))
+    application.add_handler(CommandHandler("grant", admin_grant_command))
     application.add_handler(CallbackQueryHandler(on_subscription_buy_clicked, pattern=r"^sub\|buy$"))
     application.add_handler(CallbackQueryHandler(on_purchase_item_selected, pattern=r"^buy\|"))
     application.add_handler(CallbackQueryHandler(on_purchase_decision, pattern=r"^purchase\|"))
