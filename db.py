@@ -235,6 +235,15 @@ def grant_referral_reward_if_eligible(user_id: int, is_channel_member: bool):
         return referrer_id
 
 
+def add_wallet_toman(user_id: int, amount: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE users SET wallet_toman = wallet_toman + ? WHERE user_id = ?",
+            (amount, user_id),
+        )
+        conn.commit()
+
+
 def get_wallet_toman(user_id: int) -> int:
     user = get_user(user_id)
     return user["wallet_toman"] if user else 0
@@ -273,6 +282,21 @@ def add_credits(user_id: int, amount: int) -> None:
             (amount, user_id),
         )
         conn.commit()
+
+
+def add_wallet_toman(user_id: int, amount: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE users SET wallet_toman = wallet_toman + ? WHERE user_id = ?",
+            (amount, user_id),
+        )
+        conn.commit()
+
+
+def user_exists(user_id: int) -> bool:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row is not None
 
 
 def consume_credit(user_id: int) -> bool:
